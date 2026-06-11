@@ -31,18 +31,14 @@ def extract_nav_eaf_links(html_content):
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        # NAV EAF domain lehet: eaf.nav.gov.hu, vagy nav.gov.hu/eaf, esetleg link.nav.gov.hu
-        if "eaf.nav.gov.hu" in href or "/eaf/" in href or "nav.gov.hu" in href and "arveres" in href:
+        if "eaf.nav.gov.hu" in href or "/eaf/" in href or ("nav.gov.hu" in href and "arveres" in href):
             if href.startswith("/"):
                 href = "https://eaf.nav.gov.hu" + href
             links.append(href)
     return list(set(links))
 
 def parse_nav_eaf_details(url):
-    """
-    Letölti a NAV EAF részletes oldalt és megpróbálja kinyerni a fontos adatokat.
-    Ez a függvény várja a pontos HTML struktúrát – a jelenlegi verzió általános.
-    """
+    """Letölti a NAV EAF részletes oldalt és megpróbálja kinyerni az adatokat."""
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         resp = requests.get(url, timeout=15, headers=headers)
@@ -54,17 +50,13 @@ def parse_nav_eaf_details(url):
     soup = BeautifulSoup(resp.text, "html.parser")
     data = {"url": url}
 
-    # Általános keresés: olyan elemek, amelyek szövege tartalmazza ezeket a kulcsszavakat
-    # A pontos szelektorok a valós HTML alapján lesznek cserélve.
-    # Példa mezők (a NAV EAF tipikusan használ ilyen címkéket):
-    # "Jelenlegi ár:", "Árverés vége:", "Licitek száma:", "Állapot:", "Megnevezés:", "Elhelyezkedés:", stb.
-
+    # Kulcsszavak – ezeket kell majd a valós HTML alapján finomítani
     fields = {
-        "jelenlegi_ar": ["Jelenlegi ár", "Aktuális ár", "Kezdő ár"],
+        "jelenlegi_ar": ["Jelenlegi ár", "Aktuális ár", "Kezdő ár", "Ár"],
         "hatarido": ["Árverés vége", "Befejezés", "Határidő", "Lejárat"],
         "licitek": ["Licitek száma", "Ajánlatok száma"],
         "statusz": ["Állapot", "Státusz", "Szakasz"],
-        "cim": ["Cím", "Elhelyezkedés", "Helyszín"],
+        "cim": ["Cím", "Elhelyezkedés", "Helyszín", "Megnevezés"],
         "meret": ["Telek méret", "Alapterület", "Terület", "m²"]
     }
 
@@ -73,26 +65,21 @@ def parse_nav_eaf_details(url):
         for kw in keywords:
             elem = soup.find(string=re.compile(kw, re.I))
             if elem:
-                # Megpróbáljuk a szülő elemből kiolvasni a teljes szöveget
                 parent = elem.parent
                 full_text = clean_text(parent.get_text(strip=True))
-                # Levágjuk a kulcsszót, a maradék az érték
-                # Egyszerűen kivesszük a kulcsszót és a kettőspontot
+                # Kivesszük a kulcsszót és a kettőspontot
                 value = re.sub(rf'^{re.escape(kw)}[\s:]*', '', full_text, flags=re.I)
                 found = value
                 break
         data[key] = found if found else "N/A"
 
-    # Külön a leírás (hosszabb szöveg)
+    # Leírás
     desc_elem = soup.find(class_=re.compile(r"description|leírás|reszletek", re.I))
     if not desc_elem:
         desc_elem = soup.find("div", string=re.compile(r"Leírás|Részletek", re.I))
-    if desc_elem:
-        data["leiras"] = clean_text(desc_elem.get_text(strip=True)[:300])
-    else:
-        data["leiras"] = ""
+    data["leiras"] = clean_text(desc_elem.get_text(strip=True)[:300]) if desc_elem else ""
 
-    # Ha a cím továbbra is hiányzik, próbáljuk meg a <title> vagy h1 alapján
+    # Ha a cím még mindig nincs meg, próbálkozzunk a title-lel
     if data["cim"] == "N/A":
         title = soup.find("title")
         if title:
@@ -101,6 +88,7 @@ def parse_nav_eaf_details(url):
     return data
 
 def get_emails_since(since_date):
+    """Lekéri a NAV-tól érkezett, olvasatlan e-maileket az adott dátum óta."""
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(EMAIL, PASSWORD)
@@ -130,7 +118,7 @@ def get_emails_since(since_date):
                     html_body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
             if html_body:
                 result.append(html_body)
-            # Opcionális: megjelöljük olvasottként
+            # Opcionális: megjelöljük olvasottként (ha később nem akarjuk újra látni)
             # mail.store(eid, "+FLAGS", "\\Seen")
         mail.close()
         mail.logout()
@@ -140,6 +128,7 @@ def get_emails_since(since_date):
         return []
 
 def send_telegram_summary(auctions):
+    """Összefoglaló küldése Telegramra."""
     if not auctions:
         message = "📭 Nincs új NAV EAF árverési értesítő."
     else:
@@ -155,7 +144,7 @@ def send_telegram_summary(auctions):
     asyncio.run(bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown", disable_web_page_preview=False))
 
 def main():
-    # Az előző napi reggel 8 óta (UTC-2 körüli ráhagyással)
+    # Az előző napi reggel 8 óta (UTC-2 ráhagyással)
     since = datetime.now(timezone.utc) - timedelta(days=1, hours=6)
     logger.info(f"Keresés kezdete: {since.strftime('%Y-%m-%d %H:%M')} UTC")
     emails_html = get_emails_since(since)
