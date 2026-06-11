@@ -219,9 +219,9 @@ def send_telegram_summary(auctions):
     if not auctions:
         message = "📭 Nincs új NAV EAF árverési értesítő az elmúlt 24 órában."
     else:
-        message = f"🏛️ *NAV EAF – Új árverési értesítők* ({datetime.now().strftime('%Y-%m-%d %H:%M')})\n\n"
+        message = f"<b>🏛️ NAV EAF – Új árverési értesítők ({datetime.now().strftime('%Y-%m-%d %H:%M')})</b>\n\n"
         for idx, a in enumerate(auctions, 1):
-            message += f"{idx}. *{a.get('cim', 'Cím nélkül')}*\n"
+            message += f"{idx}. <b>{a.get('cim', 'Cím nélkül')}</b>\n"
             message += f"   🏷️ Kategória: {a.get('kategoria_reszletes', 'N/A')}\n"
             message += f"   💰 Ár (becsérték): {a.get('jelenlegi_ar', 'N/A')}\n"
             message += f"   📦 Tétel: {a.get('tetel_megnevezes', 'N/A')}\n"
@@ -230,8 +230,8 @@ def send_telegram_summary(auctions):
             message += f"   📍 Megtekintés: {a.get('megtekintes_hely', 'N/A')}\n"
             if a.get('egyeb_info'):
                 message += f"   📝 Infó: {a.get('egyeb_info')[:80]}\n"
-            message += f"   🔗 [Részletek]({a['url']})\n\n"
-    bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown", disable_web_page_preview=False)
+            message += f"   🔗 <a href='{a['url']}'>Részletek</a>\n\n"
+    bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="HTML", disable_web_page_preview=False)
 
 def test_with_local_file(file_path):
     logger.info(f"Teszt mód: helyi fájl beolvasása: {file_path}")
