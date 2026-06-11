@@ -2,7 +2,6 @@ import os
 import imaplib
 import email
 from email.header import decode_header
-import re
 import requests
 from bs4 import BeautifulSoup
 from telegram import Bot
@@ -23,8 +22,10 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 
+
 def clean_text(text):
     return " ".join(text.split()) if text else ""
+
 
 def extract_nav_eaf_links(html_content):
     soup = BeautifulSoup(html_content, "html.parser")
@@ -34,8 +35,11 @@ def extract_nav_eaf_links(html_content):
         if "arveres.nav.gov.hu" in href and ("auctionId" in href or "item=auctionSummary" in href):
             if href.startswith("/"):
                 href = "https://arveres.nav.gov.hu" + href
+            # Dupla perjel normalizálása az útvonalban (host után)
+            href = href.replace("nav.gov.hu//", "nav.gov.hu/")
             links.append(href)
     return list(set(links))
+
 
 def parse_nav_eaf_details(url, html_text=None):
     if html_text is None:
@@ -116,6 +120,7 @@ def parse_nav_eaf_details(url, html_text=None):
                 elif "Egyéb infó" in key:
                     data["egyeb_info"] = value
 
+    # ---- Státusz ----
     status_div = soup.find("div", class_="Title")
     if status_div:
         status_text = clean_text(status_div.get_text())
@@ -123,7 +128,10 @@ def parse_nav_eaf_details(url, html_text=None):
             data["statusz"] = "Még nem lehet licitálni"
         else:
             data["statusz"] = status_text[:100]
+    else:
+        data["statusz"] = "N/A"
 
+    # ---- Cím és ár összefoglalók ----
     if "tetel_megnevezes" in data:
         data["cim"] = data["tetel_megnevezes"]
     elif "kategoria_reszletes" in data:
@@ -133,6 +141,49 @@ def parse_nav_eaf_details(url, html_text=None):
 
     data["jelenlegi_ar"] = data.get("becsertek", "N/A")
     return data
+
+
+def extract_html_from_message(msg):
+    """
+    Rekurzívan kinyeri a HTML tartalmat egy e-mail üzenetből,
+    beleértve a továbbított (message/rfc822) mellékleteket is.
+    """
+    html_body = None
+
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            content_disposition = str(part.get("Content-Disposition", ""))
+
+            if content_type == "text/html" and "attachment" not in content_disposition:
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    html_body = payload.decode(charset, errors="ignore")
+                    return html_body
+
+            elif content_type == "message/rfc822":
+                # Beágyazott (forwarded) üzenet kicsomagolása
+                inner_payload = part.get_payload()
+                if isinstance(inner_payload, list):
+                    for inner_msg in inner_payload:
+                        html_body = extract_html_from_message(inner_msg)
+                        if html_body:
+                            return html_body
+                elif isinstance(inner_payload, bytes):
+                    inner_msg = email.message_from_bytes(inner_payload)
+                    html_body = extract_html_from_message(inner_msg)
+                    if html_body:
+                        return html_body
+    else:
+        if msg.get_content_type() == "text/html":
+            payload = msg.get_payload(decode=True)
+            if payload:
+                charset = msg.get_content_charset() or "utf-8"
+                html_body = payload.decode(charset, errors="ignore")
+
+    return html_body
+
 
 def get_emails_since(since_date):
     """
@@ -150,6 +201,7 @@ def get_emails_since(since_date):
         if status != "OK" or not messages[0]:
             logger.info("Nincs e-mail a megadott időszakban.")
             return []
+
         email_ids = messages[0].split()
         logger.info(f"Összesen {len(email_ids)} e-mail érkezett {since_date} óta.")
 
@@ -171,34 +223,18 @@ def get_emails_since(since_date):
                 subject_str += part
 
             # Szűrés: NAV feladó vagy "Elektronikus Árverés" a tárgyban
-            is_nav = False
-            if any(sender in from_ for sender in ["-eaf@nav.gov.hu", "eaf@nav.gov.hu"]):
-                is_nav = True
-            if "Elektronikus Árverés" in subject_str or "Elektronikus Arveres" in subject_str:
-                is_nav = True
+            is_nav = (
+                any(sender in from_ for sender in ["-eaf@nav.gov.hu", "eaf@nav.gov.hu"])
+                or "Elektronikus Árverés" in subject_str
+                or "Elektronikus Arveres" in subject_str
+            )
 
             if not is_nav:
                 continue
 
             logger.info(f"NAV e-mail: {subject_str} | Feladó: {from_}")
 
-            html_body = None
-            if msg.is_multipart():
-                for part in msg.walk():
-                    ct = part.get_content_type()
-                    cd = str(part.get("Content-Disposition"))
-                    if ct == "text/html" and "attachment" not in cd:
-                        html_body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
-                        break
-                    elif ct == "message/rfc822":
-                        inner_msg = email.message_from_bytes(part.get_payload(decode=True))
-                        for inner_part in inner_msg.walk():
-                            if inner_part.get_content_type() == "text/html" and "attachment" not in str(inner_part.get("Content-Disposition")):
-                                html_body = inner_part.get_payload(decode=True).decode("utf-8", errors="ignore")
-                                break
-            else:
-                if msg.get_content_type() == "text/html":
-                    html_body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+            html_body = extract_html_from_message(msg)
 
             if html_body:
                 result.append(html_body)
@@ -211,27 +247,62 @@ def get_emails_since(since_date):
         mail.close()
         mail.logout()
         return result
+
     except Exception as e:
         logger.exception(f"IMAP hiba: {e}")
         return []
 
+
 def send_telegram_summary(auctions):
+    """
+    Telegram üzenet(ek) küldése. Ha a tartalom túllépné a 4096 karakteres
+    Telegram-limitet, az üzenetet több részre bontja.
+    """
+    MAX_LENGTH = 4000  # Biztonságos határ a 4096-os limit alatt
+
     if not auctions:
-        message = "📭 Nincs új NAV EAF árverési értesítő az elmúlt 24 órában."
-    else:
-        message = f"<b>🏛️ NAV EAF – Új árverési értesítők ({datetime.now().strftime('%Y-%m-%d %H:%M')})</b>\n\n"
-        for idx, a in enumerate(auctions, 1):
-            message += f"{idx}. <b>{a.get('cim', 'Cím nélkül')}</b>\n"
-            message += f"   🏷️ Kategória: {a.get('kategoria_reszletes', 'N/A')}\n"
-            message += f"   💰 Ár (becsérték): {a.get('jelenlegi_ar', 'N/A')}\n"
-            message += f"   📦 Tétel: {a.get('tetel_megnevezes', 'N/A')}\n"
-            message += f"   📅 Kezdés: {a.get('kezdet', 'N/A')}\n"
-            message += f"   ⏰ Befejezés: {a.get('befejezes', 'N/A')}\n"
-            message += f"   📍 Megtekintés: {a.get('megtekintes_hely', 'N/A')}\n"
-            if a.get('egyeb_info'):
-                message += f"   📝 Infó: {a.get('egyeb_info')[:80]}\n"
-            message += f"   🔗 <a href='{a['url']}'>Részletek</a>\n\n"
-    bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="HTML", disable_web_page_preview=False)
+        bot.send_message(
+            chat_id=CHAT_ID,
+            text="📭 Nincs új NAV EAF árverési értesítő az elmúlt 24 órában.",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    header = f"<b>🏛️ NAV EAF – Új árverési értesítők ({datetime.now().strftime('%Y-%m-%d %H:%M')})</b>\n\n"
+    chunks = []
+    current_chunk = header
+
+    for idx, a in enumerate(auctions, 1):
+        entry = f"{idx}. <b>{a.get('cim', 'Cím nélkül')}</b>\n"
+        entry += f"   🏷️ Kategória: {a.get('kategoria_reszletes', 'N/A')}\n"
+        entry += f"   💰 Ár (becsérték): {a.get('jelenlegi_ar', 'N/A')}\n"
+        entry += f"   📦 Tétel: {a.get('tetel_megnevezes', 'N/A')}\n"
+        entry += f"   📅 Kezdés: {a.get('kezdet', 'N/A')}\n"
+        entry += f"   ⏰ Befejezés: {a.get('befejezes', 'N/A')}\n"
+        entry += f"   📍 Megtekintés: {a.get('megtekintes_hely', 'N/A')}\n"
+        entry += f"   📊 Státusz: {a.get('statusz', 'N/A')}\n"
+        if a.get("egyeb_info"):
+            entry += f"   📝 Infó: {a['egyeb_info'][:80]}\n"
+        entry += f"   🔗 <a href='{a['url']}'>Részletek</a>\n\n"
+
+        if len(current_chunk) + len(entry) > MAX_LENGTH:
+            chunks.append(current_chunk)
+            current_chunk = entry
+        else:
+            current_chunk += entry
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    for chunk in chunks:
+        bot.send_message(
+            chat_id=CHAT_ID,
+            text=chunk,
+            parse_mode="HTML",
+            disable_web_page_preview=False,
+        )
+
 
 def test_with_local_file(file_path):
     logger.info(f"Teszt mód: helyi fájl beolvasása: {file_path}")
@@ -246,6 +317,7 @@ def test_with_local_file(file_path):
     else:
         logger.error("Nem sikerült kinyerni az adatokat a helyi fájlból.")
 
+
 def main():
     if TEST_MODE:
         test_with_local_file(TEST_HTML_FILE)
@@ -253,6 +325,7 @@ def main():
 
     since = datetime.now(timezone.utc) - timedelta(days=1)
     logger.info(f"Keresés kezdete: {since.strftime('%Y-%m-%d %H:%M')} UTC")
+
     emails_html = get_emails_since(since)
     if not emails_html:
         send_telegram_summary([])
@@ -267,8 +340,9 @@ def main():
             if details:
                 all_auctions.append(details)
 
-    unique = {a["url"]: a for a in all_auctions}.values()
-    send_telegram_summary(list(unique))
+    unique = list({a["url"]: a for a in all_auctions}.values())
+    send_telegram_summary(unique)
+
 
 if __name__ == "__main__":
     main()
