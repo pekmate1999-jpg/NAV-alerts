@@ -2,8 +2,17 @@ name: Daily NAV EAF Scraper
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # UTC 6:00 = CET/CEST 7:00/8:00 – állítsd át ha szükséges
+    - cron: '0 6 * * *'   # UTC 6:00 = magyar idő szerint 7:00 (tél) / 8:00 (nyár)
   workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Teszt mód (true/false)'
+        required: false
+        default: 'false'
+      test_html_file:
+        description: 'Teszt HTML fájl neve'
+        required: false
+        default: 'NAV Elektronikus Árverési Felület.html'
 
 jobs:
   scrape:
@@ -20,4 +29,6 @@ jobs:
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
+          TEST_HTML_FILE: ${{ github.event.inputs.test_html_file || 'NAV Elektronikus Árverési Felület.html' }}
         run: python scraper.py
