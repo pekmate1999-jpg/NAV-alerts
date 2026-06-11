@@ -1,0 +1,7 @@
+imaplib2
+email
+beautifulsoup4
+requests
+python-telegram-bot==13.7  # (vagy legújabb, de ez stabil)
+lxml
+html5lib
