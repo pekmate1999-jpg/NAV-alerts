@@ -14,11 +14,9 @@ PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# Alapértelmezett feladó és tárgy kulcsszavak
 NAV_SENDER_DEFAULT = "-eaf@nav.gov.hu"
 NAV_SUBJECT_KEYWORDS = ["Elektronikus Árverés - Hírlevél", "Fwd: Elektronikus Árverés - Hírlevél"]
 
-# Teszt mód bekapcsolása (ha TRUE, akkor helyi fájlt használ)
 TEST_MODE = os.environ.get("TEST_MODE", "").lower() == "true"
 TEST_HTML_FILE = os.environ.get("TEST_HTML_FILE", "NAV Elektronikus Árverési Felület.html")
 
@@ -31,7 +29,6 @@ def clean_text(text):
     return " ".join(text.split()) if text else ""
 
 def extract_nav_eaf_links(html_content):
-    """Kinyeri a NAV EAF oldalakra mutató linkeket az e-mail HTML tartalmából."""
     soup = BeautifulSoup(html_content, "html.parser")
     links = []
     for a in soup.find_all("a", href=True):
@@ -43,10 +40,6 @@ def extract_nav_eaf_links(html_content):
     return list(set(links))
 
 def parse_nav_eaf_details(url, html_text=None):
-    """
-    Kinyeri az adatokat a NAV EAF részletes oldalról.
-    Ha html_text adott, akkor azt használja (teszt mód), különben letölti az URL-t.
-    """
     if html_text is None:
         try:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -125,7 +118,6 @@ def parse_nav_eaf_details(url, html_text=None):
                 elif "Egyéb infó" in key:
                     data["egyeb_info"] = value
 
-    # ---- Árverés státusz ----
     status_div = soup.find("div", class_="Title")
     if status_div:
         status_text = clean_text(status_div.get_text())
@@ -134,7 +126,6 @@ def parse_nav_eaf_details(url, html_text=None):
         else:
             data["statusz"] = status_text[:100]
 
-    # ---- Cím összeállítása ----
     if "tetel_megnevezes" in data:
         data["cim"] = data["tetel_megnevezes"]
     elif "kategoria_reszletes" in data:
@@ -146,24 +137,20 @@ def parse_nav_eaf_details(url, html_text=None):
     return data
 
 def get_emails_since(since_date):
-    """
-    Lekéri a NAV EAF értesítő e-maileket az adott dátum óta.
-    Először feladó alapján keres, ha nincs találat, akkor tárgy kulcsszavak alapján.
-    """
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(EMAIL, PASSWORD)
         mail.select("inbox")
 
         email_ids = []
-        # 1. keresés: feladó alapján
+        # Feladó alapján
         search_criteria_sender = f'(FROM "{NAV_SENDER_DEFAULT}" SINCE "{since_date.strftime("%d-%b-%Y")}")'
         status, messages = mail.search(None, search_criteria_sender)
         if status == "OK" and messages[0]:
             email_ids.extend(messages[0].split())
             logger.info(f"Feladó alapján {len(messages[0].split())} e-mail található.")
 
-        # 2. keresés: tárgy kulcsszavak alapján (továbbított e-mailek miatt)
+        # Tárgy kulcsszavak alapján
         for keyword in NAV_SUBJECT_KEYWORDS:
             search_criteria_subj = f'(SUBJECT "{keyword}" SINCE "{since_date.strftime("%d-%b-%Y")}")'
             status, messages = mail.search(None, search_criteria_subj)
@@ -172,7 +159,6 @@ def get_emails_since(since_date):
                 email_ids.extend(new_ids)
                 logger.info(f"Tárgy '{keyword}' alapján {len(new_ids)} e-mail található.")
 
-        # Duplikátumok eltávolítása
         email_ids = list(set(email_ids))
         logger.info(f"Összesen {len(email_ids)} egyedi e-mail található {since_date} óta.")
 
@@ -194,7 +180,6 @@ def get_emails_since(since_date):
                     html_body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
             if html_body:
                 result.append(html_body)
-            # Feldolgozás után olvasottnak jelöljük
             mail.store(eid, "+FLAGS", "\\Seen")
         mail.close()
         mail.logout()
@@ -222,12 +207,13 @@ def send_telegram_summary(auctions):
     bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown", disable_web_page_preview=False)
 
 def test_with_local_file(file_path):
-    """Teszt mód: helyi HTML fájlból olvas (a részletes oldal)."""
+    """Teszt mód: helyi HTML fájlból olvas (ISO-8859-2 kódolással)."""
     logger.info(f"Teszt mód: helyi fájl beolvasása: {file_path}")
     if not os.path.exists(file_path):
         logger.error(f"A fájl nem található: {file_path}")
         return
-    with open(file_path, "r", encoding="utf-8") as f:
+    # A HTML fájl ISO-8859-2 kódolású, ezt kell használni
+    with open(file_path, "r", encoding="iso-8859-2") as f:
         html = f.read()
     # A tesztben a fájl maga a részletes oldal (nem e-mail), ezért közvetlenül meghívjuk a parsert
     details = parse_nav_eaf_details("file://" + os.path.abspath(file_path), html_text=html)
@@ -241,7 +227,6 @@ def main():
         test_with_local_file(TEST_HTML_FILE)
         return
 
-    # Normál mód: az utolsó 24 órában érkezett e-mailek
     since = datetime.now(timezone.utc) - timedelta(days=1)
     logger.info(f"Keresés kezdete: {since.strftime('%Y-%m-%d %H:%M')} UTC")
     emails_html = get_emails_since(since)
