@@ -1,6 +1,7 @@
 import os
 import imaplib
 import email
+from email.header import decode_header
 import re
 import requests
 from bs4 import BeautifulSoup
@@ -14,8 +15,19 @@ PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-NAV_SENDER_DEFAULT = "-eaf@nav.gov.hu"
-NAV_SUBJECT_KEYWORDS = ["Elektronikus Árverés - Hírlevél", "Fwd: Elektronikus Árverés - Hírlevél"]
+# Bővített feladó címek és tárgy kulcsszavak
+NAV_SENDERS = [
+    "-eaf@nav.gov.hu",
+    "eaf@nav.gov.hu",
+    "nav.eaf@nav.gov.hu",
+    "NAV EAF"
+]
+NAV_SUBJECT_KEYWORDS = [
+    "Elektronikus Árverés - Hírlevél",
+    "Fwd: Elektronikus Árverés - Hírlevél",
+    "NAV EAF",
+    "Árverés értesítő"
+]
 
 TEST_MODE = os.environ.get("TEST_MODE", "").lower() == "true"
 TEST_HTML_FILE = os.environ.get("TEST_HTML_FILE", "NAV Elektronikus Árverési Felület.html")
@@ -143,24 +155,27 @@ def get_emails_since(since_date):
         mail.select("inbox")
 
         email_ids = []
-        # Feladó alapján
-        search_criteria_sender = f'(FROM "{NAV_SENDER_DEFAULT}" SINCE "{since_date.strftime("%d-%b-%Y")}")'
-        status, messages = mail.search(None, search_criteria_sender)
-        if status == "OK" and messages[0]:
-            email_ids.extend(messages[0].split())
-            logger.info(f"Feladó alapján {len(messages[0].split())} e-mail található.")
 
-        # Tárgy kulcsszavak alapján
-        for keyword in NAV_SUBJECT_KEYWORDS:
-            search_criteria_subj = f'(SUBJECT "{keyword}" SINCE "{since_date.strftime("%d-%b-%Y")}")'
-            status, messages = mail.search(None, search_criteria_subj)
+        # Keresés feladókra
+        for sender in NAV_SENDERS:
+            search_criteria = f'(FROM "{sender}" SINCE "{since_date.strftime("%d-%b-%Y")}")'
+            status, messages = mail.search(None, search_criteria)
             if status == "OK" and messages[0]:
                 new_ids = messages[0].split()
                 email_ids.extend(new_ids)
-                logger.info(f"Tárgy '{keyword}' alapján {len(new_ids)} e-mail található.")
+                logger.info(f"Feladó '{sender}' alapján {len(new_ids)} e-mail.")
+
+        # Keresés tárgy kulcsszavakra
+        for keyword in NAV_SUBJECT_KEYWORDS:
+            search_criteria = f'(SUBJECT "{keyword}" SINCE "{since_date.strftime("%d-%b-%Y")}")'
+            status, messages = mail.search(None, search_criteria)
+            if status == "OK" and messages[0]:
+                new_ids = messages[0].split()
+                email_ids.extend(new_ids)
+                logger.info(f"Tárgy '{keyword}' alapján {len(new_ids)} e-mail.")
 
         email_ids = list(set(email_ids))
-        logger.info(f"Összesen {len(email_ids)} egyedi e-mail található {since_date} óta.")
+        logger.info(f"Összesen {len(email_ids)} egyedi e-mail a megadott időszakban.")
 
         result = []
         for eid in email_ids:
@@ -169,18 +184,42 @@ def get_emails_since(since_date):
                 continue
             raw_email = msg_data[0][1]
             msg = email.message_from_bytes(raw_email)
+
+            # Logolás
+            subject_parts = decode_header(msg.get("Subject", ""))
+            subject_str = ""
+            for part, enc in subject_parts:
+                if isinstance(part, bytes):
+                    part = part.decode(enc or "utf-8", errors="ignore")
+                subject_str += part
+            from_ = msg.get("From", "")
+            logger.info(f"Feldolgozás: {subject_str} | Feladó: {from_}")
+
             html_body = None
             if msg.is_multipart():
                 for part in msg.walk():
-                    if part.get_content_type() == "text/html" and "attachment" not in str(part.get("Content-Disposition")):
+                    ct = part.get_content_type()
+                    cd = str(part.get("Content-Disposition"))
+                    if ct == "text/html" and "attachment" not in cd:
                         html_body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
                         break
+                    elif ct == "message/rfc822":
+                        inner_msg = email.message_from_bytes(part.get_payload(decode=True))
+                        for inner_part in inner_msg.walk():
+                            if inner_part.get_content_type() == "text/html" and "attachment" not in str(inner_part.get("Content-Disposition")):
+                                html_body = inner_part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                                break
             else:
                 if msg.get_content_type() == "text/html":
                     html_body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+
             if html_body:
                 result.append(html_body)
+            else:
+                logger.warning(f"Nincs HTML tartalom az e-mailben: {subject_str}")
+
             mail.store(eid, "+FLAGS", "\\Seen")
+
         mail.close()
         mail.logout()
         return result
@@ -207,15 +246,12 @@ def send_telegram_summary(auctions):
     bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown", disable_web_page_preview=False)
 
 def test_with_local_file(file_path):
-    """Teszt mód: helyi HTML fájlból olvas (ISO-8859-2 kódolással)."""
     logger.info(f"Teszt mód: helyi fájl beolvasása: {file_path}")
     if not os.path.exists(file_path):
         logger.error(f"A fájl nem található: {file_path}")
         return
-    # A HTML fájl ISO-8859-2 kódolású, ezt kell használni
     with open(file_path, "r", encoding="iso-8859-2") as f:
         html = f.read()
-    # A tesztben a fájl maga a részletes oldal (nem e-mail), ezért közvetlenül meghívjuk a parsert
     details = parse_nav_eaf_details("file://" + os.path.abspath(file_path), html_text=html)
     if details:
         send_telegram_summary([details])
