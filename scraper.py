@@ -41,7 +41,7 @@ def parse_nav_eaf_details(url, html_text=None):
     if html_text is None:
         try:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            resp = requests.get(url, timeout=15, headers=headers)
+            resp = requests.get(url, timeout=30, headers=headers)
             resp.raise_for_status()
             resp.encoding = "ISO-8859-2"
             html_text = resp.text
