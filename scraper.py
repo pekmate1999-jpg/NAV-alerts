@@ -159,68 +159,32 @@ def get_drive_distance(dest_address):
 def scrape_main_image(url, soup):
     """
     Kinyeri a Képgaléria szekció főképének URL-jét.
-    Több stratégiával próbálkozik, ha az első nem talál semmit.
+
+    A NAV EAF oldalon a nagy kép JavaScript-tel töltődik be a #defaultPicture
+    div-be, ezért BeautifulSoup nem látja. Ehelyett a thumbnail <img> tagek
+    'fullurl' attribútumát olvassuk ki – ez tartalmazza a teljes méretű kép
+    relatív URL-jét (pl. pictures/9/e/700876.jpg), ami session nélkül is
+    elérhető.
     """
-    def make_absolute(src, base_url):
-        if not src:
-            return None
-        src = src.strip()
-        if src.startswith("http"):
-            return src
-        if src.startswith("/"):
-            return "https://arveres.nav.gov.hu" + src
-        base = base_url.split("?")[0].rsplit("/", 1)[0]
-        return base + "/" + src
+    BASE = "https://arveres.nav.gov.hu/"
 
     try:
-        # 1. stratégia: Képgaléria FrissPortlet div keresése
-        for div in soup.find_all("div", class_="FrissPortlet"):
-            header = div.find("div", class_="HeaderTitle")
-            if header and "Képgaléria" in header.get_text():
-                img_tag = div.find("img")
-                if img_tag:
-                    src = make_absolute(img_tag.get("src", ""), url)
-                    if src:
-                        logger.info(f"Kép URL (FrissPortlet): {src}")
-                        return src
-
-        # 2. stratégia: bármely <td> cella első képe (a nagy főkép bal oldalon)
-        # A NAV oldalon a képgaléria egy táblázat bal cellájában van
-        for td in soup.find_all("td"):
-            img_tag = td.find("img")
-            if img_tag:
-                src = img_tag.get("src", "")
-                if src and ("image" in src.lower() or "foto" in src.lower()
-                            or "kep" in src.lower() or "picture" in src.lower()
-                            or "jpg" in src.lower() or "jpeg" in src.lower()
-                            or "png" in src.lower() or "showImage" in src):
-                    src = make_absolute(src, url)
-                    if src:
-                        logger.info(f"Kép URL (td keresés): {src}")
-                        return src
-
-        # 3. stratégia: az összes img közül az első nem-ikonméretű
-        for img_tag in soup.find_all("img"):
-            src = img_tag.get("src", "")
-            # Kihagyjuk a nyilvánvaló ikonokat/logókat
-            if not src or any(skip in src.lower() for skip in ["logo", "icon", "bullet", "arrow", "nav_"]):
+        # Keressük az összes img taget, aminek van fullurl attribútuma
+        for img_tag in soup.find_all("img", fullurl=True):
+            fullurl = img_tag.get("fullurl", "").strip()
+            if not fullurl:
                 continue
-            width = img_tag.get("width", "")
-            height = img_tag.get("height", "")
-            # Ha van méret info és nagyon kicsi, kihagyjuk
-            try:
-                if width and int(width) < 50:
-                    continue
-                if height and int(height) < 50:
-                    continue
-            except ValueError:
-                pass
-            src = make_absolute(src, url)
-            if src:
-                logger.info(f"Kép URL (általános img keresés): {src}")
-                return src
+            # Abszolút URL építése
+            if fullurl.startswith("http"):
+                image_url = fullurl
+            elif fullurl.startswith("/"):
+                image_url = "https://arveres.nav.gov.hu" + fullurl
+            else:
+                image_url = BASE + fullurl
+            logger.info(f"Kép URL (fullurl attribútum): {image_url}")
+            return image_url
 
-        logger.warning("Egyetlen kép sem található az oldalon.")
+        logger.warning("Nem található fullurl attribútumú kép az oldalon.")
         return None
 
     except Exception as e:
@@ -338,7 +302,7 @@ def parse_nav_eaf_details(url, html_text=None):
         result = get_drive_distance(megtekintes_hely)
         if result:
             km, minutes = result
-            data["tavolsag"] = f"{km} km ({minutes} perc autóval, {ORIGIN_LABEL})"
+            data["tavolsag"] = f"{km} km ({minutes} perc autóval)"
         else:
             data["tavolsag"] = "Nem sikerült kiszámítani"
     else:
