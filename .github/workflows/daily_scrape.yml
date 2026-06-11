@@ -1,0 +1,28 @@
+name: Daily NAV Auction Scraper
+
+on:
+  schedule:
+    # Minden nap 8:00-kor (UTC+2-őt állítsd át, ha kell, de itt UTC-ben adjuk meg)
+    # Magyarország télen UTC+1, nyáron UTC+2. Hogy reggel 8-kor fusson, UTC 6:00-kor kell indítani (nyáron).
+    # Használj * helyett konkrét időt, pl. 6:00 UTC = 8:00 CEST.
+    - cron: '0 6 * * *'
+  workflow_dispatch:   # kézi indítás is lehessen
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run scraper
+        env:
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python scraper.py
