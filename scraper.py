@@ -1,12 +1,10 @@
 import os
 import imaplib
 import email
-from email.header import decode_header
 import re
 import requests
 from bs4 import BeautifulSoup
 from telegram import Bot
-import asyncio
 from datetime import datetime, timezone, timedelta
 import logging
 
@@ -15,7 +13,14 @@ EMAIL = os.environ.get("EMAIL_ADDRESS")
 PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-NAV_SENDER = "-eaf@nav.gov.hu"
+
+# Alapértelmezett feladó és tárgy kulcsszavak
+NAV_SENDER_DEFAULT = "-eaf@nav.gov.hu"
+NAV_SUBJECT_KEYWORDS = ["Elektronikus Árverés - Hírlevél", "Fwd: Elektronikus Árverés - Hírlevél"]
+
+# Teszt mód bekapcsolása (ha TRUE, akkor helyi fájlt használ)
+TEST_MODE = os.environ.get("TEST_MODE", "").lower() == "true"
+TEST_HTML_FILE = os.environ.get("TEST_HTML_FILE", "NAV Elektronikus Árverési Felület.html")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -31,75 +36,146 @@ def extract_nav_eaf_links(html_content):
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if "eaf.nav.gov.hu" in href or "/eaf/" in href or ("nav.gov.hu" in href and "arveres" in href):
+        if "arveres.nav.gov.hu" in href and ("auctionId" in href or "item=auctionSummary" in href):
             if href.startswith("/"):
-                href = "https://eaf.nav.gov.hu" + href
+                href = "https://arveres.nav.gov.hu" + href
             links.append(href)
     return list(set(links))
 
-def parse_nav_eaf_details(url):
-    """Letölti a NAV EAF részletes oldalt és megpróbálja kinyerni az adatokat."""
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        resp = requests.get(url, timeout=15, headers=headers)
-        resp.raise_for_status()
-    except Exception as e:
-        logger.error(f"Hiba a NAV EAF oldal betöltésekor: {url} - {e}")
-        return None
+def parse_nav_eaf_details(url, html_text=None):
+    """
+    Kinyeri az adatokat a NAV EAF részletes oldalról.
+    Ha html_text adott, akkor azt használja (teszt mód), különben letölti az URL-t.
+    """
+    if html_text is None:
+        try:
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            resp = requests.get(url, timeout=15, headers=headers)
+            resp.raise_for_status()
+            resp.encoding = "ISO-8859-2"
+            html_text = resp.text
+        except Exception as e:
+            logger.error(f"Hiba a NAV EAF oldal betöltésekor: {url} - {e}")
+            return None
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(html_text, "html.parser")
     data = {"url": url}
 
-    # Kulcsszavak – ezeket kell majd a valós HTML alapján finomítani
-    fields = {
-        "jelenlegi_ar": ["Jelenlegi ár", "Aktuális ár", "Kezdő ár", "Ár"],
-        "hatarido": ["Árverés vége", "Befejezés", "Határidő", "Lejárat"],
-        "licitek": ["Licitek száma", "Ajánlatok száma"],
-        "statusz": ["Állapot", "Státusz", "Szakasz"],
-        "cim": ["Cím", "Elhelyezkedés", "Helyszín", "Megnevezés"],
-        "meret": ["Telek méret", "Alapterület", "Terület", "m²"]
-    }
+    # ---- Árverés alapadatok táblázat ----
+    alapadatok_table = None
+    for div in soup.find_all("div", class_="FrissPortlet"):
+        header = div.find("div", class_="HeaderTitle")
+        if header and "Árverés alapadatok" in header.get_text():
+            alapadatok_table = div.find("table", class_="DownloadAppsList")
+            break
 
-    for key, keywords in fields.items():
-        found = None
-        for kw in keywords:
-            elem = soup.find(string=re.compile(kw, re.I))
-            if elem:
-                parent = elem.parent
-                full_text = clean_text(parent.get_text(strip=True))
-                # Kivesszük a kulcsszót és a kettőspontot
-                value = re.sub(rf'^{re.escape(kw)}[\s:]*', '', full_text, flags=re.I)
-                found = value
-                break
-        data[key] = found if found else "N/A"
+    if alapadatok_table:
+        rows = alapadatok_table.find_all("tr", class_="Bg2")
+        for row in rows:
+            cells = row.find_all("td")
+            if len(cells) >= 2:
+                key = clean_text(cells[0].get_text())
+                value = clean_text(cells[1].get_text())
+                if "Árverés megnevezése" in key:
+                    data["kategoria"] = value
+                elif "Végrehajtási ügyszám" in key:
+                    data["ugyintezesi_szam"] = value
+                elif "Árverés kategória" in key:
+                    data["kategoria_reszletes"] = value
+                elif "Árverés sorszáma" in key:
+                    data["sorszam"] = value
+                elif "Árverés meghirdetése" in key:
+                    data["meghirdetes"] = value
+                elif "Árverés kezdete" in key:
+                    data["kezdet"] = value
+                elif "Árverés befejezése" in key:
+                    data["befejezes"] = value
+                elif "Ügyintéző telefon" in key:
+                    data["telefon"] = value
+                elif "Az árverezett tétel megtekinthető, hely" in key:
+                    data["megtekintes_hely"] = value
+                elif "Az árverezett tétel megtekinthető, idő" in key:
+                    data["megtekintes_ido"] = value
 
-    # Leírás
-    desc_elem = soup.find(class_=re.compile(r"description|leírás|reszletek", re.I))
-    if not desc_elem:
-        desc_elem = soup.find("div", string=re.compile(r"Leírás|Részletek", re.I))
-    data["leiras"] = clean_text(desc_elem.get_text(strip=True)[:300]) if desc_elem else ""
+    # ---- Árverezett tétel adatok táblázat ----
+    tetel_table = None
+    for div in soup.find_all("div", class_="FrissPortlet"):
+        header = div.find("div", class_="HeaderTitle")
+        if header and "Árverezett tétel adatok" in header.get_text():
+            tetel_table = div.find("table", class_="DownloadAppsList")
+            break
 
-    # Ha a cím még mindig nincs meg, próbálkozzunk a title-lel
-    if data["cim"] == "N/A":
-        title = soup.find("title")
-        if title:
-            data["cim"] = clean_text(title.get_text(strip=True))
+    if tetel_table:
+        rows = tetel_table.find_all("tr", class_="Bg2")
+        for row in rows:
+            cells = row.find_all("td")
+            if len(cells) >= 2:
+                key = clean_text(cells[0].get_text())
+                value = clean_text(cells[1].get_text())
+                if "Tétel megnevezése" in key:
+                    data["tetel_megnevezes"] = value
+                elif "Becsérték" in key:
+                    data["becsertek"] = value
+                elif "Minimál ajánlat" in key:
+                    data["minimal_ajanlat"] = value
+                elif "Egyszerre árverezett tétel darabszám" in key:
+                    data["darabszam"] = value
+                elif "Állapot" in key:
+                    data["allapot"] = value
+                elif "Egyéb infó" in key:
+                    data["egyeb_info"] = value
 
+    # ---- Árverés státusz ----
+    status_div = soup.find("div", class_="Title")
+    if status_div:
+        status_text = clean_text(status_div.get_text())
+        if "nem lehet licitálni" in status_text:
+            data["statusz"] = "Még nem lehet licitálni"
+        else:
+            data["statusz"] = status_text[:100]
+
+    # ---- Cím összeállítása ----
+    if "tetel_megnevezes" in data:
+        data["cim"] = data["tetel_megnevezes"]
+    elif "kategoria_reszletes" in data:
+        data["cim"] = data["kategoria_reszletes"]
+    else:
+        data["cim"] = "Ismeretlen tétel"
+
+    data["jelenlegi_ar"] = data.get("becsertek", "N/A")
     return data
 
 def get_emails_since(since_date):
-    """Lekéri a NAV-tól érkezett, olvasatlan e-maileket az adott dátum óta."""
+    """
+    Lekéri a NAV EAF értesítő e-maileket az adott dátum óta.
+    Először feladó alapján keres, ha nincs találat, akkor tárgy kulcsszavak alapján.
+    """
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(EMAIL, PASSWORD)
         mail.select("inbox")
-        search_criteria = f'(FROM "{NAV_SENDER}" SINCE "{since_date.strftime("%d-%b-%Y")}" UNSEEN)'
-        status, messages = mail.search(None, search_criteria)
-        if status != "OK":
-            logger.error("IMAP keresés sikertelen.")
-            return []
-        email_ids = messages[0].split()
-        logger.info(f"{len(email_ids)} új NAV e-mail (olvasatlan) {since_date} óta.")
+
+        email_ids = []
+        # 1. keresés: feladó alapján
+        search_criteria_sender = f'(FROM "{NAV_SENDER_DEFAULT}" SINCE "{since_date.strftime("%d-%b-%Y")}")'
+        status, messages = mail.search(None, search_criteria_sender)
+        if status == "OK" and messages[0]:
+            email_ids.extend(messages[0].split())
+            logger.info(f"Feladó alapján {len(messages[0].split())} e-mail található.")
+
+        # 2. keresés: tárgy kulcsszavak alapján (továbbított e-mailek miatt)
+        for keyword in NAV_SUBJECT_KEYWORDS:
+            search_criteria_subj = f'(SUBJECT "{keyword}" SINCE "{since_date.strftime("%d-%b-%Y")}")'
+            status, messages = mail.search(None, search_criteria_subj)
+            if status == "OK" and messages[0]:
+                new_ids = messages[0].split()
+                email_ids.extend(new_ids)
+                logger.info(f"Tárgy '{keyword}' alapján {len(new_ids)} e-mail található.")
+
+        # Duplikátumok eltávolítása
+        email_ids = list(set(email_ids))
+        logger.info(f"Összesen {len(email_ids)} egyedi e-mail található {since_date} óta.")
+
         result = []
         for eid in email_ids:
             status, msg_data = mail.fetch(eid, "(RFC822)")
@@ -118,8 +194,8 @@ def get_emails_since(since_date):
                     html_body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
             if html_body:
                 result.append(html_body)
-            # Opcionális: megjelöljük olvasottként (ha később nem akarjuk újra látni)
-            # mail.store(eid, "+FLAGS", "\\Seen")
+            # Feldolgozás után olvasottnak jelöljük
+            mail.store(eid, "+FLAGS", "\\Seen")
         mail.close()
         mail.logout()
         return result
@@ -128,24 +204,45 @@ def get_emails_since(since_date):
         return []
 
 def send_telegram_summary(auctions):
-    """Összefoglaló küldése Telegramra."""
     if not auctions:
-        message = "📭 Nincs új NAV EAF árverési értesítő."
+        message = "📭 Nincs új NAV EAF árverési értesítő az elmúlt 24 órában."
     else:
-        message = f"🏛️ *NAV EAF – Új árverési értesítők* ({datetime.now().strftime('%Y-%m-%d')})\n\n"
+        message = f"🏛️ *NAV EAF – Új árverési értesítők* ({datetime.now().strftime('%Y-%m-%d %H:%M')})\n\n"
         for idx, a in enumerate(auctions, 1):
             message += f"{idx}. *{a.get('cim', 'Cím nélkül')}*\n"
-            message += f"   💰 Ár: {a.get('jelenlegi_ar', 'N/A')}\n"
-            message += f"   📏 Méret: {a.get('meret', 'N/A')}\n"
-            message += f"   ⏰ Vége: {a.get('hatarido', 'N/A')}\n"
-            message += f"   🎲 Licit: {a.get('licitek', 'N/A')}\n"
-            message += f"   📊 Státusz: {a.get('statusz', 'N/A')}\n"
+            message += f"   🏷️ Kategória: {a.get('kategoria_reszletes', 'N/A')}\n"
+            message += f"   💰 Ár (becsérték): {a.get('jelenlegi_ar', 'N/A')}\n"
+            message += f"   📦 Tétel: {a.get('tetel_megnevezes', 'N/A')}\n"
+            message += f"   📅 Kezdés: {a.get('kezdet', 'N/A')}\n"
+            message += f"   ⏰ Befejezés: {a.get('befejezes', 'N/A')}\n"
+            message += f"   📍 Megtekintés: {a.get('megtekintes_hely', 'N/A')}\n"
+            if a.get('egyeb_info'):
+                message += f"   📝 Infó: {a.get('egyeb_info')[:80]}\n"
             message += f"   🔗 [Részletek]({a['url']})\n\n"
-    asyncio.run(bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown", disable_web_page_preview=False))
+    bot.send_message(chat_id=CHAT_ID, text=message, parse_mode="Markdown", disable_web_page_preview=False)
+
+def test_with_local_file(file_path):
+    """Teszt mód: helyi HTML fájlból olvas (a részletes oldal)."""
+    logger.info(f"Teszt mód: helyi fájl beolvasása: {file_path}")
+    if not os.path.exists(file_path):
+        logger.error(f"A fájl nem található: {file_path}")
+        return
+    with open(file_path, "r", encoding="utf-8") as f:
+        html = f.read()
+    # A tesztben a fájl maga a részletes oldal (nem e-mail), ezért közvetlenül meghívjuk a parsert
+    details = parse_nav_eaf_details("file://" + os.path.abspath(file_path), html_text=html)
+    if details:
+        send_telegram_summary([details])
+    else:
+        logger.error("Nem sikerült kinyerni az adatokat a helyi fájlból.")
 
 def main():
-    # Az előző napi reggel 8 óta (UTC-2 ráhagyással)
-    since = datetime.now(timezone.utc) - timedelta(days=1, hours=6)
+    if TEST_MODE:
+        test_with_local_file(TEST_HTML_FILE)
+        return
+
+    # Normál mód: az utolsó 24 órában érkezett e-mailek
+    since = datetime.now(timezone.utc) - timedelta(days=1)
     logger.info(f"Keresés kezdete: {since.strftime('%Y-%m-%d %H:%M')} UTC")
     emails_html = get_emails_since(since)
     if not emails_html:
