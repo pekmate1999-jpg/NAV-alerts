@@ -15,20 +15,6 @@ PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# Bővített feladó címek és tárgy kulcsszavak
-NAV_SENDERS = [
-    "-eaf@nav.gov.hu",
-    "eaf@nav.gov.hu",
-    "nav.eaf@nav.gov.hu",
-    "NAV EAF"
-]
-NAV_SUBJECT_KEYWORDS = [
-    "Elektronikus Árverés - Hírlevél",
-    "Fwd: Elektronikus Árverés - Hírlevél",
-    "NAV EAF",
-    "Árverés értesítő"
-]
-
 TEST_MODE = os.environ.get("TEST_MODE", "").lower() == "true"
 TEST_HTML_FILE = os.environ.get("TEST_HTML_FILE", "NAV Elektronikus Árverési Felület.html")
 
@@ -149,33 +135,23 @@ def parse_nav_eaf_details(url, html_text=None):
     return data
 
 def get_emails_since(since_date):
+    """
+    Lekéri az összes e-mailt a megadott dátum óta,
+    majd kliens oldalon szűri a NAV és továbbított e-maileket.
+    """
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(EMAIL, PASSWORD)
         mail.select("inbox")
 
-        email_ids = []
-
-        # Keresés feladókra
-        for sender in NAV_SENDERS:
-            search_criteria = f'(FROM "{sender}" SINCE "{since_date.strftime("%d-%b-%Y")}")'
-            status, messages = mail.search(None, search_criteria)
-            if status == "OK" and messages[0]:
-                new_ids = messages[0].split()
-                email_ids.extend(new_ids)
-                logger.info(f"Feladó '{sender}' alapján {len(new_ids)} e-mail.")
-
-        # Keresés tárgy kulcsszavakra
-        for keyword in NAV_SUBJECT_KEYWORDS:
-            search_criteria = f'(SUBJECT "{keyword}" SINCE "{since_date.strftime("%d-%b-%Y")}")'
-            status, messages = mail.search(None, search_criteria)
-            if status == "OK" and messages[0]:
-                new_ids = messages[0].split()
-                email_ids.extend(new_ids)
-                logger.info(f"Tárgy '{keyword}' alapján {len(new_ids)} e-mail.")
-
-        email_ids = list(set(email_ids))
-        logger.info(f"Összesen {len(email_ids)} egyedi e-mail a megadott időszakban.")
+        # Csak dátum alapján keresünk (elkerülve az ékezetes karaktereket)
+        search_criteria = f'(SINCE "{since_date.strftime("%d-%b-%Y")}")'
+        status, messages = mail.search(None, search_criteria)
+        if status != "OK" or not messages[0]:
+            logger.info("Nincs e-mail a megadott időszakban.")
+            return []
+        email_ids = messages[0].split()
+        logger.info(f"Összesen {len(email_ids)} e-mail érkezett {since_date} óta.")
 
         result = []
         for eid in email_ids:
@@ -185,15 +161,26 @@ def get_emails_since(since_date):
             raw_email = msg_data[0][1]
             msg = email.message_from_bytes(raw_email)
 
-            # Logolás
+            # Feladó és tárgy kinyerése
+            from_ = msg.get("From", "")
             subject_parts = decode_header(msg.get("Subject", ""))
             subject_str = ""
             for part, enc in subject_parts:
                 if isinstance(part, bytes):
                     part = part.decode(enc or "utf-8", errors="ignore")
                 subject_str += part
-            from_ = msg.get("From", "")
-            logger.info(f"Feldolgozás: {subject_str} | Feladó: {from_}")
+
+            # Szűrés: NAV feladó vagy "Elektronikus Árverés" a tárgyban
+            is_nav = False
+            if any(sender in from_ for sender in ["-eaf@nav.gov.hu", "eaf@nav.gov.hu"]):
+                is_nav = True
+            if "Elektronikus Árverés" in subject_str or "Elektronikus Arveres" in subject_str:
+                is_nav = True
+
+            if not is_nav:
+                continue
+
+            logger.info(f"NAV e-mail: {subject_str} | Feladó: {from_}")
 
             html_body = None
             if msg.is_multipart():
@@ -216,8 +203,9 @@ def get_emails_since(since_date):
             if html_body:
                 result.append(html_body)
             else:
-                logger.warning(f"Nincs HTML tartalom az e-mailben: {subject_str}")
+                logger.warning(f"Nincs HTML tartalom a NAV e-mailben: {subject_str}")
 
+            # Megjelöljük olvasottként
             mail.store(eid, "+FLAGS", "\\Seen")
 
         mail.close()
