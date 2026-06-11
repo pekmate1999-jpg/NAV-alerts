@@ -91,6 +91,7 @@ def geocode_address(address):
     Fokozatosan egyszerűsített lekérdezésekkel próbálkozik, ha az eredeti nem talál semmit.
     Visszaad (lat, lon) tuple-t vagy None-t hiba esetén.
     """
+    import time
     candidates = simplify_address(address)
     headers = {"User-Agent": "NAV-EAF-Scraper/1.0"}
 
@@ -117,8 +118,11 @@ def geocode_address(address):
                 return lat, lon
             else:
                 logger.info(f"Geocode: nincs találat erre: '{candidate}', következő próba...")
+            # Nominatim fair-use: max 1 kérés/másodperc
+            time.sleep(1.1)
         except Exception as e:
             logger.error(f"Geocode hiba ('{candidate}'): {e}")
+            time.sleep(1.1)
 
     logger.warning(f"Geocode: minden próba sikertelen: '{address}'")
     return None
@@ -423,23 +427,44 @@ def get_emails_since(since_date):
 
 def send_auction_message(idx, a):
     """
-    Egy árverési tételt küld el Telegram üzenetként képpel együtt.
+    Egy árverési tételt küld el Telegram üzenetként képpel együtt,
+    MBVK-stílusú kategorizált formátumban.
     """
-    caption = (
-        f"<b>🏛️ {a.get('cim', 'Cím nélkül')}</b>\n\n"
-        f"🏷️ <b>Kategória:</b> {a.get('kategoria_reszletes', 'N/A')}\n"
-        f"💰 <b>Becsérték:</b> {a.get('becsertek', 'N/A')}\n"
-        f"💸 <b>Minimál ajánlat:</b> {a.get('minimal_ajanlat', 'N/A')}\n"
-        f"📦 <b>Állapot:</b> {a.get('allapot', 'N/A')}\n"
-        f"📅 <b>Kezdés:</b> {a.get('kezdet', 'N/A')}\n"
-        f"⏰ <b>Befejezés:</b> {a.get('befejezes', 'N/A')}\n"
-        f"📍 <b>Megtekintés:</b> {a.get('megtekintes_hely', 'N/A')}\n"
-        f"🕐 <b>Megtekintési idő:</b> {a.get('megtekintes_ido', 'N/A')}\n"
-        f"🚗 <b>Távolság:</b> {a.get('tavolsag', 'N/A')}\n"
-    )
-    if a.get("egyeb_info"):
-        caption += f"📝 <b>Infó:</b> {a['egyeb_info'][:200]}\n"
-    caption += f"\n🔗 <a href='{a['url']}'>Részletek megtekintése</a>"
+    caption = f"🏛️ <b>{a.get('cim', 'Cím nélkül')}</b>\n\n"
+
+    # 1. Tétel alapadatok
+    caption += "📦 <b>1. Tétel alapadatok</b>\n"
+    caption += f"🏷️ Kategória: {a.get('kategoria_reszletes', 'N/A')}\n"
+    caption += f"📊 Állapot: {a.get('allapot', 'N/A')}\n"
+    if a.get('darabszam'):
+        caption += f"🔢 Darabszám: {a.get('darabszam')}\n"
+    caption += "\n"
+
+    # 2. Pénzügyi információk
+    caption += "💰 <b>2. Pénzügyi információk</b>\n"
+    caption += f"💵 Becsérték: {a.get('becsertek', 'N/A')}\n"
+    caption += f"💸 Minimál ajánlat: {a.get('minimal_ajanlat', 'N/A')}\n"
+    caption += "\n"
+
+    # 3. Időpontok
+    caption += "📅 <b>3. Időpontok</b>\n"
+    caption += f"▶️ Kezdés: {a.get('kezdet', 'N/A')}\n"
+    caption += f"⏹️ Befejezés: {a.get('befejezes', 'N/A')}\n"
+    caption += "\n"
+
+    # 4. Megtekintés
+    caption += "📍 <b>4. Megtekintés</b>\n"
+    caption += f"🗺️ Helyszín: {a.get('megtekintes_hely', 'N/A')}\n"
+    caption += f"🕐 Időpont: {a.get('megtekintes_ido', 'N/A')}\n"
+    caption += f"🚗 Távolság: {a.get('tavolsag', 'N/A')}\n"
+    caption += "\n"
+
+    # 5. Leírás (ha van)
+    if a.get('egyeb_info'):
+        caption += "📝 <b>5. Leírás</b>\n"
+        caption += f"<i>{a['egyeb_info'][:250]}</i>\n\n"
+
+    caption += f"🔗 <a href='{a['url']}'>Részletek megtekintése</a>"
 
     # Telegram caption limit: 1024 karakter
     if len(caption) > 1024:
