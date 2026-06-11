@@ -43,38 +43,85 @@ def extract_nav_eaf_links(html_content):
     return list(set(links))
 
 
+def simplify_address(address):
+    """
+    Fokozatosan egyszerűsíti a címet a geocodinghoz.
+    Visszaad egy listát a próbálandó változatokból (legspecifikusabbtól a legsimábbig).
+    """
+    import re
+    candidates = []
+
+    # 1. Eredeti cím
+    candidates.append(address)
+
+    # 2. Levágjuk a hrsz-t, helyrajzi számot és a 'külterület' / 'belterület' szót
+    cleaned = re.sub(r",?\s*\d+(/\d+)?\s*hrsz\.?", "", address, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(külterület|belterület|tanya)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip().rstrip(",").strip()
+    if cleaned and cleaned != address:
+        candidates.append(cleaned)
+
+    # 3. Csak irányítószám + városnév (minden utáni részt levágjuk az első vessző után)
+    # pl. "2475 Kápolnásnyék" a "2475 Kápolnásnyék külterület, 0172/16 hrsz"-ből
+    city_match = re.match(r"(\d{4}\s+[A-Za-záéíóöőúüűÁÉÍÓÖŐÚÜŰ][A-Za-záéíóöőúüűÁÉÍÓÖŐÚÜŰ\s\-]+?)(?:\s*,|\s+\d|\s+külterület|\s+belterület|$)", cleaned or address)
+    if city_match:
+        city_only = city_match.group(1).strip()
+        if city_only not in candidates:
+            candidates.append(city_only)
+
+    # 4. Csak az irányítószám + "Magyarország"
+    zip_match = re.match(r"(\d{4})", address)
+    if zip_match:
+        zip_candidate = zip_match.group(1) + ", Magyarország"
+        if zip_candidate not in candidates:
+            candidates.append(zip_candidate)
+
+    # Üres stringek és duplikátumok eltávolítása, sorrend megtartásával
+    seen = []
+    for c in candidates:
+        c = c.strip()
+        if c and c not in seen:
+            seen.append(c)
+    return seen
+
+
 def geocode_address(address):
     """
     Cím geocodolása Nominatim API-val (OpenStreetMap).
+    Fokozatosan egyszerűsített lekérdezésekkel próbálkozik, ha az eredeti nem talál semmit.
     Visszaad (lat, lon) tuple-t vagy None-t hiba esetén.
     """
-    try:
-        params = {
-            "q": address,
-            "format": "json",
-            "limit": 1,
-            "countrycodes": "hu",
-        }
-        headers = {"User-Agent": "NAV-EAF-Scraper/1.0"}
-        resp = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params=params,
-            headers=headers,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        results = resp.json()
-        if results:
-            lat = float(results[0]["lat"])
-            lon = float(results[0]["lon"])
-            logger.info(f"Geocode OK: {address} → ({lat}, {lon})")
-            return lat, lon
-        else:
-            logger.warning(f"Geocode: nincs találat: {address}")
-            return None
-    except Exception as e:
-        logger.error(f"Geocode hiba: {address} - {e}")
-        return None
+    candidates = simplify_address(address)
+    headers = {"User-Agent": "NAV-EAF-Scraper/1.0"}
+
+    for candidate in candidates:
+        try:
+            params = {
+                "q": candidate,
+                "format": "json",
+                "limit": 1,
+                "countrycodes": "hu",
+            }
+            resp = requests.get(
+                "https://nominatim.openstreetmap.org/search",
+                params=params,
+                headers=headers,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            results = resp.json()
+            if results:
+                lat = float(results[0]["lat"])
+                lon = float(results[0]["lon"])
+                logger.info(f"Geocode OK: '{candidate}' (eredeti: '{address}') → ({lat}, {lon})")
+                return lat, lon
+            else:
+                logger.info(f"Geocode: nincs találat erre: '{candidate}', következő próba...")
+        except Exception as e:
+            logger.error(f"Geocode hiba ('{candidate}'): {e}")
+
+    logger.warning(f"Geocode: minden próba sikertelen: '{address}'")
+    return None
 
 
 def get_drive_distance(dest_address):
@@ -112,53 +159,91 @@ def get_drive_distance(dest_address):
 def scrape_main_image(url, soup):
     """
     Kinyeri a Képgaléria szekció főképének URL-jét.
-    A nagy kép egy <img> tag a 'Képgaléria' fejléc alatti első táblázatcellában.
+    Több stratégiával próbálkozik, ha az első nem talál semmit.
     """
+    def make_absolute(src, base_url):
+        if not src:
+            return None
+        src = src.strip()
+        if src.startswith("http"):
+            return src
+        if src.startswith("/"):
+            return "https://arveres.nav.gov.hu" + src
+        base = base_url.split("?")[0].rsplit("/", 1)[0]
+        return base + "/" + src
+
     try:
-        # Képgaléria div keresése
-        kepgaleria_div = None
+        # 1. stratégia: Képgaléria FrissPortlet div keresése
         for div in soup.find_all("div", class_="FrissPortlet"):
             header = div.find("div", class_="HeaderTitle")
             if header and "Képgaléria" in header.get_text():
-                kepgaleria_div = div
-                break
+                img_tag = div.find("img")
+                if img_tag:
+                    src = make_absolute(img_tag.get("src", ""), url)
+                    if src:
+                        logger.info(f"Kép URL (FrissPortlet): {src}")
+                        return src
 
-        if not kepgaleria_div:
-            logger.warning("Képgaléria szekció nem található.")
-            return None
+        # 2. stratégia: bármely <td> cella első képe (a nagy főkép bal oldalon)
+        # A NAV oldalon a képgaléria egy táblázat bal cellájában van
+        for td in soup.find_all("td"):
+            img_tag = td.find("img")
+            if img_tag:
+                src = img_tag.get("src", "")
+                if src and ("image" in src.lower() or "foto" in src.lower()
+                            or "kep" in src.lower() or "picture" in src.lower()
+                            or "jpg" in src.lower() or "jpeg" in src.lower()
+                            or "png" in src.lower() or "showImage" in src):
+                    src = make_absolute(src, url)
+                    if src:
+                        logger.info(f"Kép URL (td keresés): {src}")
+                        return src
 
-        # Az első <img> tag a galériában (a nagy főkép)
-        img_tag = kepgaleria_div.find("img")
-        if not img_tag:
-            logger.warning("Kép tag nem található a Képgaléria szekcióban.")
-            return None
+        # 3. stratégia: az összes img közül az első nem-ikonméretű
+        for img_tag in soup.find_all("img"):
+            src = img_tag.get("src", "")
+            # Kihagyjuk a nyilvánvaló ikonokat/logókat
+            if not src or any(skip in src.lower() for skip in ["logo", "icon", "bullet", "arrow", "nav_"]):
+                continue
+            width = img_tag.get("width", "")
+            height = img_tag.get("height", "")
+            # Ha van méret info és nagyon kicsi, kihagyjuk
+            try:
+                if width and int(width) < 50:
+                    continue
+                if height and int(height) < 50:
+                    continue
+            except ValueError:
+                pass
+            src = make_absolute(src, url)
+            if src:
+                logger.info(f"Kép URL (általános img keresés): {src}")
+                return src
 
-        src = img_tag.get("src", "")
-        if not src:
-            return None
+        logger.warning("Egyetlen kép sem található az oldalon.")
+        return None
 
-        # Relatív URL → abszolút
-        if src.startswith("/"):
-            src = "https://arveres.nav.gov.hu" + src
-        elif not src.startswith("http"):
-            base = url.split("?")[0].rsplit("/", 1)[0]
-            src = base + "/" + src
-
-        logger.info(f"Kép URL: {src}")
-        return src
     except Exception as e:
         logger.error(f"Kép scrape hiba: {e}")
         return None
 
 
-def download_image(image_url):
+def download_image(image_url, session=None):
     """
     Letölti a képet és visszaadja bytes-ként, vagy None-t hiba esetén.
+    Opcionálisan átvehet egy requests.Session-t (pl. bejelentkezett session).
     """
     try:
+        req = session or requests
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        resp = requests.get(image_url, timeout=20, headers=headers)
+        resp = req.get(image_url, timeout=20, headers=headers)
+        logger.info(f"Kép letöltés: {image_url} → HTTP {resp.status_code}, {len(resp.content)} byte")
         resp.raise_for_status()
+        # Ellenőrzés: valóban kép-e (nem login redirect HTML)
+        content_type = resp.headers.get("Content-Type", "")
+        if "image" not in content_type:
+            logger.warning(f"Kép letöltés: nem kép tartalom ({content_type}), valószínűleg session szükséges.")
+            return None
         return resp.content
     except Exception as e:
         logger.error(f"Kép letöltési hiba: {image_url} - {e}")
@@ -399,25 +484,36 @@ def send_auction_message(idx, a):
     image_url = a.get("image_url")
     image_bytes = download_image(image_url) if image_url else None
 
-    try:
-        if image_bytes:
+    sent = False
+
+    # 1. próba: letöltött kép bytes-ként
+    if image_bytes:
+        try:
             bot.send_photo(
                 chat_id=CHAT_ID,
                 photo=io.BytesIO(image_bytes),
                 caption=caption,
                 parse_mode="HTML",
             )
-        else:
-            # Ha nincs kép, sima szöveges üzenet
-            bot.send_message(
+            sent = True
+        except Exception as e:
+            logger.warning(f"Kép küldés (bytes) sikertelen: {e}")
+
+    # 2. próba: kép URL-ként átadva (Telegram tölti le)
+    if not sent and image_url:
+        try:
+            bot.send_photo(
                 chat_id=CHAT_ID,
-                text=caption,
+                photo=image_url,
+                caption=caption,
                 parse_mode="HTML",
-                disable_web_page_preview=False,
             )
-    except Exception as e:
-        logger.error(f"Telegram küldési hiba ({a.get('cim', '?')}): {e}")
-        # Fallback: kép nélkül próbálja meg
+            sent = True
+        except Exception as e:
+            logger.warning(f"Kép küldés (URL) sikertelen: {e}")
+
+    # 3. fallback: szöveges üzenet kép nélkül
+    if not sent:
         try:
             bot.send_message(
                 chat_id=CHAT_ID,
@@ -425,8 +521,8 @@ def send_auction_message(idx, a):
                 parse_mode="HTML",
                 disable_web_page_preview=False,
             )
-        except Exception as e2:
-            logger.error(f"Telegram fallback küldési hiba: {e2}")
+        except Exception as e:
+            logger.error(f"Telegram szöveges küldés is sikertelen ({a.get('cim', '?')}): {e}")
 
 
 def send_telegram_messages(auctions):
