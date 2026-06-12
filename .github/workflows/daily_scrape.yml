@@ -20,4 +20,6 @@ jobs:
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          REAL_ESTATE_BOT_TOKEN: ${{ secrets.REAL_ESTATE_BOT_TOKEN }}
+          REAL_ESTATE_CHAT_ID: ${{ secrets.REAL_ESTATE_CHAT_ID }}
         run: python scraper.py
