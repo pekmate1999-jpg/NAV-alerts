@@ -5,6 +5,7 @@ import email
 from email.header import decode_header
 import requests
 from bs4 import BeautifulSoup
+from telegram import Bot
 from datetime import datetime, timezone, timedelta
 import logging
 import io
@@ -26,8 +27,8 @@ SEEN_URLS_FILE = os.path.join(os.path.dirname(__file__), "seen_urls.json")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Globális gyorsítótár a geokódoláshoz, hogy elkerüljük a Nominatim blokkolást/lassulást
-GEOCODE_CACHE = {}
+bot = Bot(token=BOT_TOKEN)
+
 
 # =================== Látott URL-ek kezelése ===================
 
@@ -48,7 +49,7 @@ def save_seen_urls(seen: set):
     """Elmenti a látott URL-ek halmazát a JSON fájlba."""
     try:
         with open(SEEN_URLS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"seen_urls": sorted(list(seen))}, f, ensure_ascii=False, indent=2)
+            json.dump({"seen_urls": sorted(seen)}, f, ensure_ascii=False, indent=2)
         logger.info(f"Látott URL-ek mentve: {len(seen)} db → {SEEN_URLS_FILE}")
     except Exception as e:
         logger.error(f"Látott URL-ek mentési hiba: {e}")
@@ -64,7 +65,7 @@ def filter_new_auctions(auctions: list, seen: set) -> list:
 # =================== Csoportosítás ===================
 
 def group_auctions_by_category(auctions: list) -> dict:
-    """📂 Az árveréseket kategória szerint csoportosítja."""
+    """Az árveréseket kategória szerint csoportosítja."""
     groups = {}
     for a in auctions:
         cat = (
@@ -130,13 +131,6 @@ def simplify_address(address):
 
 def geocode_address(address):
     import time
-    if not address:
-        return None
-    
-    # Ha ezt a címet ebben a futásban már lekértük, azonnal adjuk vissza az eredményt
-    if address in GEOCODE_CACHE:
-        return GEOCODE_CACHE[address]
-
     candidates = simplify_address(address)
     headers = {"User-Agent": "NAV-EAF-Scraper/1.0"}
 
@@ -150,7 +144,6 @@ def geocode_address(address):
                 lat = float(results[0]["lat"])
                 lon = float(results[0]["lon"])
                 logger.info(f"Geocode OK: '{candidate}' → ({lat}, {lon})")
-                GEOCODE_CACHE[address] = (lat, lon)
                 return lat, lon
             else:
                 logger.info(f"Geocode: nincs találat: '{candidate}', következő próba...")
@@ -160,7 +153,6 @@ def geocode_address(address):
             time.sleep(1.1)
 
     logger.warning(f"Geocode: minden próba sikertelen: '{address}'")
-    GEOCODE_CACHE[address] = None
     return None
 
 
@@ -182,7 +174,7 @@ def get_drive_distance(dest_address):
             route = data["routes"][0]
             km = round(route["distance"] / 1000, 1)
             minutes = round(route["duration"] / 60)
-            return km, minutes
+            return f"{km} km ({minutes} perc autóval)"
         else:
             logger.warning(f"OSRM: nem sikerült útvonalat számítani: {data.get('code')}")
             return None
@@ -218,11 +210,9 @@ def download_image(image_url, session=None):
         req = session or requests
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         resp = req.get(image_url, timeout=20, headers=headers)
-        logger.info(f"Kép letöltés: {image_url} → HTTP {resp.status_code}, {len(resp.content)} byte")
         resp.raise_for_status()
         content_type = resp.headers.get("Content-Type", "")
         if "image" not in content_type:
-            logger.warning(f"Nem kép tartalom ({content_type}), session szükséges?")
             return None
         return resp.content
     except Exception as e:
@@ -294,7 +284,7 @@ def parse_nav_eaf_details(url, html_text=None):
             if len(cells) >= 2:
                 key = clean_text(cells[0].get_text())
                 value = clean_text(cells[1].get_text())
-                if "Tétel megnevezése" in key:
+                if "Tétel megnevezése" in key or "Ingatlan megnevezése" in key:
                     data["tetel_megnevezes"] = value
                 elif "Becsérték" in key:
                     data["becsertek"] = value
@@ -306,19 +296,40 @@ def parse_nav_eaf_details(url, html_text=None):
                     data["allapot"] = value
                 elif "Egyéb infó" in key:
                     data["egyeb_info"] = value
+                elif "Cím irányítószám, város" in key:
+                    data["ingatlan_varos"] = value
+                elif "Cím utca" in key:
+                    data["ingatlan_utca"] = value
+                elif "Házszám, emelet, ajtó" in key:
+                    data["ingatlan_hazszam"] = value
+                elif "Tulajdoni hányad" in key:
+                    data["tulajdoni_hanyad"] = value
+                elif "Helyrajzi szám" in key:
+                    data["hrsz"] = value
+                elif "Terület" in key:
+                    data["terulet"] = value
 
     data["image_url"] = scrape_main_image(url, soup)
 
+    # Pontos cím rekonstrukció ingatlanok esetén
+    varos = data.get("ingatlan_varos", "")
+    utca = data.get("ingatlan_utca", "")
+    hazszam = data.get("ingatlan_hazszam", "")
+    ingatlan_cim = ", ".join(filter(None, [varos, utca, hazszam]))
+    if ingatlan_cim:
+        data["pontos_cim"] = ingatlan_cim
+
+    # Geokódolási célpont meghatározása
     megtekintes_hely = data.get("megtekintes_hely", "")
-    if megtekintes_hely:
-        result = get_drive_distance(megtekintes_hely)
-        if result:
-            km, minutes = result
-            data["tavolsag"] = f"{km} km ({minutes} perc autóval)"
-        else:
-            data["tavolsag"] = "Nem sikerült kiszámítani"
+    geocoding_target = megtekintes_hely
+    if megtekintes_hely and "ingatlan cím" in megtekintes_hely.lower() and ingatlan_cim:
+        geocoding_target = ingatlan_cim
+
+    if geocoding_target and geocoding_target.strip().upper() != "N/A":
+        distance_result = get_drive_distance(geocoding_target)
+        data["tavolsag"] = distance_result if distance_result else None
     else:
-        data["tavolsag"] = "N/A"
+        data["tavolsag"] = None
 
     if "tetel_megnevezes" in data:
         data["cim"] = data["tetel_megnevezes"]
@@ -371,16 +382,13 @@ def get_emails_since(since_date):
         mail.login(EMAIL, PASSWORD)
         mail.select("inbox")
 
-        # MODOSÍTÁS: Csak az olvasatlan (UNSEEN) levelek lekérése
-        search_criteria = f'(UNSEEN SINCE "{since_date.strftime("%d-%b-%Y")}")'
+        search_criteria = f'(SINCE "{since_date.strftime("%d-%b-%Y")}")'
         status, messages = mail.search(None, search_criteria)
         if status != "OK" or not messages[0]:
-            logger.info("Nincs új olvasatlan e-mail a megadott időszakban.")
+            logger.info("Nincs e-mail a megadott időszakban.")
             return []
 
         email_ids = messages[0].split()
-        logger.info(f"Összesen {len(email_ids)} olvasatlan e-mail érkezett {since_date} óta.")
-
         result = []
         for eid in email_ids:
             status, msg_data = mail.fetch(eid, "(RFC822)")
@@ -406,13 +414,9 @@ def get_emails_since(since_date):
             if not is_nav:
                 continue
 
-            logger.info(f"NAV e-mail: {subject_str} | Feladó: {from_}")
-
             html_body = extract_html_from_message(msg)
             if html_body:
                 result.append(html_body)
-            else:
-                logger.warning(f"Nincs HTML tartalom a NAV e-mailben: {subject_str}")
 
             mail.store(eid, "+FLAGS", "\\Seen")
 
@@ -425,36 +429,67 @@ def get_emails_since(since_date):
         return []
 
 
-# =================== Telegram küldés (Tiszta HTTP API alapon) ===================
+# =================== Telegram küldés ===================
+
+def send_group_header(category: str, count: int):
+    """Kategória-fejléc üzenetet küld a csoport elé."""
+    text = (
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📂 <b>{category}</b>  •  {count} tétel\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    try:
+        bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"Fejléc küldési hiba: {e}")
+
 
 def send_auction_message(idx: int, a: dict):
-    """Egy árverési tételt küld el Telegram üzenetként közvetlen API hívással."""
+    """Egy árverési tételt küld el Telegram üzenetként, elrejtve a hiányzó/NA mezőket."""
     caption = f"🏛️ <b>{a.get('cim', 'Cím nélkül')}</b>\n\n"
 
-    caption += "📦 <b>1. Tétel alapadatok</b>\n"
-    caption += f"🏷️ Kategória: {a.get('kategoria_reszletes', 'N/A')}\n"
-    caption += f"📊 Állapot: {a.get('allapot', 'N/A')}\n"
-    if a.get("darabszam"):
-        caption += f"🔢 Darabszám: {a.get('darabszam')}\n"
-    caption += "\n"
+    def add_field(label, value):
+        """Csak akkor adja hozzá a mezőt, ha van érvényes, nem N/A értéke."""
+        if value and str(value).strip().upper() != "N/A" and str(value).strip() != "":
+            return f"{label} {value}\n"
+        return ""
 
-    caption += "💰 <b>2. Pénzügyi információk</b>\n"
-    caption += f"💵 Becsérték: {a.get('becsertek', 'N/A')}\n"
-    caption += f"💸 Minimál ajánlat: {a.get('minimal_ajanlat', 'N/A')}\n"
-    caption += "\n"
+    # 1. Tétel alapadatok
+    section1 = ""
+    section1 += add_field("🏷️ Kategória:", a.get("kategoria_reszletes"))
+    section1 += add_field("📊 Állapot:", a.get("allapot"))
+    section1 += add_field("🔢 Darabszám:", a.get("darabszam"))
+    section1 += add_field("📐 Terület:", a.get("terulet"))
+    section1 += add_field("👤 Tulajdoni hányad:", a.get("tulajdoni_hanyad"))
+    section1 += add_field("📝 Hrsz:", a.get("hrsz"))
+    if section1:
+        caption += "📦 <b>1. Tétel alapadatok</b>\n" + section1 + "\n"
 
-    caption += "📅 <b>3. Időpontok</b>\n"
-    caption += f"▶️ Kezdés: {a.get('kezdet', 'N/A')}\n"
-    caption += f"⏹️ Befejezés: {a.get('befejezes', 'N/A')}\n"
-    caption += "\n"
+    # 2. Pénzügyi információk
+    section2 = ""
+    section2 += add_field("💵 Becsérték:", a.get("becsertek"))
+    section2 += add_field("💸 Minimál ajánlat:", a.get("minimal_ajanlat"))
+    if section2:
+        caption += "💰 <b>2. Pénzügyi információk</b>\n" + section2 + "\n"
 
-    caption += "📍 <b>4. Megtekintés</b>\n"
-    caption += f"🗺️ Helyszín: {a.get('megtekintes_hely', 'N/A')}\n"
-    caption += f"🕐 Időpont: {a.get('megtekintes_ido', 'N/A')}\n"
-    caption += f"🚗 Távolság: {a.get('tavolsag', 'N/A')}\n"
-    caption += "\n"
+    # 3. Időpontok
+    section3 = ""
+    section3 += add_field("▶️ Kezdés:", a.get("kezdet"))
+    section3 += add_field("⏹️ Befejezés:", a.get("befejezes"))
+    if section3:
+        caption += "📅 <b>3. Időpontok</b>\n" + section3 + "\n"
 
-    if a.get("egyeb_info"):
+    # 4. Megtekintés / Helyszín
+    section4 = ""
+    section4 += add_field("📍 Pontos cím:", a.get("pontos_cim"))
+    section4 += add_field("🗺️ Helyszín:", a.get("megtekintes_hely"))
+    section4 += add_field("🕐 Időpont:", a.get("megtekintes_ido"))
+    section4 += add_field("🚗 Távolság:", a.get("tavolsag"))
+    if section4:
+        caption += "📍 <b>4. Megtekintés</b>\n" + section4 + "\n"
+
+    # 5. Leírás
+    if a.get("egyeb_info") and a["egyeb_info"].strip().upper() != "N/A" and a["egyeb_info"].strip() != "":
         caption += "📝 <b>5. Leírás</b>\n"
         caption += f"<i>{a['egyeb_info'][:250]}</i>\n\n"
 
@@ -465,135 +500,88 @@ def send_auction_message(idx: int, a: dict):
 
     image_url = a.get("image_url")
     image_bytes = download_image(image_url) if image_url else None
-    
-    payload = {
-        "chat_id": CHAT_ID,
-        "parse_mode": "HTML"
-    }
+    sent = False
 
-    # Próba: Kép küldése letöltött bájtokból
     if image_bytes:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-        payload["caption"] = caption
-        files = {"photo": ("image.jpg", io.BytesIO(image_bytes), "image/jpeg")}
         try:
-            resp = requests.post(url, data=payload, files=files, timeout=20)
-            if resp.status_code == 200:
-                return
-            logger.warning(f"Kép küldés (bájtok) sikertelen, státusz: {resp.status_code}")
+            bot.send_photo(chat_id=CHAT_ID, photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
+            sent = True
         except Exception as e:
-            logger.warning(f"Kép küldési hiba (bájtok): {e}")
+            logger.warning(f"Kép küldés (bytes) sikertelen: {e}")
 
-    # Próba: Kép küldése távoli URL alapon
-    if image_url:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-        payload["photo"] = image_url
-        payload["caption"] = caption
+    if not sent and image_url:
         try:
-            resp = requests.post(url, data=payload, timeout=20)
-            if resp.status_code == 200:
-                return
-            logger.warning(f"Kép küldés (URL) sikertelen, státusz: {resp.status_code}")
+            bot.send_photo(chat_id=CHAT_ID, photo=image_url, caption=caption, parse_mode="HTML")
+            sent = True
         except Exception as e:
-            logger.warning(f"Kép küldési hiba (URL): {e}")
+            logger.warning(f"Kép küldés (URL) sikertelen: {e}")
 
-    # B-terv: Sima szöveges üzenet kép nélkül
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload["text"] = caption
-    payload.pop("caption", None)
-    payload.pop("photo", None)
-    try:
-        resp = requests.post(url, data=payload, timeout=20)
-        if resp.status_code != 200:
-            logger.error(f"Telegram szövegküldés sikertelen, státusz: {resp.status_code}")
-    except Exception as e:
-        logger.error(f"Telegram szövegküldési hiba: {e}")
+    if not sent:
+        try:
+            bot.send_message(chat_id=CHAT_ID, text=caption, parse_mode="HTML", disable_web_page_preview=False)
+        except Exception as e:
+            logger.error(f"Telegram szöveges küldés is sikertelen ({a.get('cim', '?')}): {e}")
 
 
 def send_telegram_messages(auctions: list):
-    """Az árveréseket elküldi Telegramra csoportosítva (kategória fejlécek nélkül)."""
+    """Az árveréseket kategória szerint csoportosítva küldi el Telegramra."""
     if not auctions:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": CHAT_ID,
-            "text": "📭 Nincs új NAV EAF árverési értesítő (minden már ismert).",
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }
-        try:
-            requests.post(url, data=payload, timeout=20)
-        except Exception as e:
-            logger.error(f"Üres értesítő küldési hiba: {e}")
+        bot.send_message(
+            chat_id=CHAT_ID,
+            text="📭 Nincs új NAV EAF árverési értesítő (minden már ismert).",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
         return
 
     groups = group_auctions_by_category(auctions)
     total = sum(len(v) for v in groups.values())
     cat_count = len(groups)
 
-    # Összefoglaló felső üzenet indításkor
     summary = (
         f"🔔 <b>Új NAV EAF árverések</b>\n"
         f"📊 Összesen: <b>{total} új tétel</b> / <b>{cat_count} kategória</b>\n"
         f"🕐 {datetime.now().strftime('%Y.%m.%d %H:%M')}"
     )
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": summary, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=20)
+        bot.send_message(chat_id=CHAT_ID, text=summary, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.error(f"Összefoglaló fejléc küldési hiba: {e}")
 
-    # Tételek küldése (A kategória-fejléc üzenetek eltávolítva)
     for category, items in groups.items():
+        send_group_header(category, len(items))
         for idx, a in enumerate(items, 1):
-            logger.info(f"Küldés [{category}] {idx}/{len(items)}: {a.get('cim', '?')}")
             send_auction_message(idx, a)
-
-    logger.info(f"Telegram küldés kész: {total} tétel, {cat_count} kategória.")
 
 
 # =================== Fő logika ===================
 
 def main():
     since = datetime.now(timezone.utc) - timedelta(days=1)
-    logger.info(f"=== NAV EAF Scraper v1.01 indítás: {datetime.now().strftime('%Y.%m.%d %H:%M')} ===")
-    logger.info(f"E-mail keresés kezdete: {since.strftime('%Y-%m-%d %H:%M')} UTC")
+    logger.info(f"=== NAV EAF Scraper v1.01 indítás ===")
 
-    # 1. Látott URL-ek betöltése
     seen_urls = load_seen_urls()
-    logger.info(f"Már ismert URL-ek száma: {len(seen_urls)}")
-
-    # 2. E-mailek lekérése és linkek kinyerése
     emails_html = get_emails_since(since)
     if not emails_html:
-        logger.info("Nem érkezett új olvasatlan NAV e-mail az elmúlt 24 órában.")
         send_telegram_messages([])
         return
 
     all_auctions = []
     for html in emails_html:
         links = extract_nav_eaf_links(html)
-        logger.info(f"Talált NAV EAF linkek: {links}")
         for link in links:
             details = parse_nav_eaf_details(link)
             if details:
                 all_auctions.append(details)
 
-    # 3. URL-alapú deduplikáció az aktuális futáson belül
     unique = list({a["url"]: a for a in all_auctions}.values())
-    logger.info(f"Egyedi árverések (aktuális futás): {len(unique)} db")
-
-    # 4. Szűrés: csak azok, amelyekről még NEM küldtünk értesítőt
     new_auctions = filter_new_auctions(unique, seen_urls)
 
-    # 5. Telegram üzenetek küldése
     send_telegram_messages(new_auctions)
 
-    # 6. Látott URL-ek frissítése és mentése
     for a in new_auctions:
         seen_urls.add(a["url"])
     save_seen_urls(seen_urls)
-
-    logger.info("=== Futás befejezve ===")
 
 
 if __name__ == "__main__":
