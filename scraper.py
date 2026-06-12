@@ -117,11 +117,9 @@ def generate_gcal_url(title, date_str, location="", details=""):
             end_dt = end_dt.replace(tzinfo=bp_tz)
             start_utc = start_dt.astimezone(timezone.utc)
             end_utc = end_dt.astimezone(timezone.utc)
-            # MÓDOSÍTVA: pontos másodperc (00) és 'Z' UTC jelölés
             start_str = start_utc.strftime("%Y%m%dT%H%M%SZ")
             end_str = end_utc.strftime("%Y%m%dT%H%M%SZ")
         else:
-            # Biztonsági mentés
             start_str = start_dt.strftime("%Y%m%dT%H%M%SZ")
             end_str = end_dt.strftime("%Y%m%dT%H%M%SZ")
 
@@ -693,16 +691,29 @@ def build_mnv_ear_message(a: dict) -> str:
     """Telegram értesítő MNV EAR hírlevélből kinyert ingatlanhoz."""
     alkategoria = escape_html(a.get("alkategoria") or "Ingatlan")
     tetel = escape_html(a.get("tetel_nev_azonosito") or "Ismeretlen")
-    # MÓDOSÍTVA: a felesleges 'Cím:' sor eltávolítva (a tétel már tartalmazza a címet)
     ar = escape_html(a.get("kikialtas_ar") or "N/A")
     meghirdetes = escape_html(a.get("meghirdetes") or "N/A")
     hatarido = escape_html(a.get("biztosítek_hatarido") or "")
     kezdet = escape_html(a.get("kezdet") or "N/A")
     befejezes = escape_html(a.get("befejezes") or "N/A")
 
+    # MÓDOSÍTVA: MNV EAR dinamikus link előállítása az azonosítóból
+    mnv_id = a.get("mnv_id")  # pl. "50002/260611"
+    auction_link = "#"
+    if mnv_id:
+        match = re.match(r'(\d+)/', mnv_id)
+        if match:
+            auction_id = match.group(1)
+            auction_link = f"https://e-arveres.mnv.hu/?actionId=action.auction.AuctionSummaryAction&auctionId={auction_id}&FRAME_SKIP_DEJAVU=1"
+
     reszletek = f"Kikiáltási ár: {a.get('kikialtas_ar', 'N/A')} | MNV EAR árverés"
     kezdet_url = generate_gcal_url(f"MNV Árverés Kezdete: {a.get('cim_rovid', '')}", kezdet, "", reszletek)
     befejezes_url = generate_gcal_url(f"MNV Árverés Vége: {a.get('cim_rovid', '')}", befejezes, "", reszletek)
+    
+    # MÓDOSÍTVA: Biztosíték határidejéhez naptár link generálása
+    hatarido_url = None
+    if hatarido:
+        hatarido_url = generate_gcal_url(f"MNV Biztosíték határideje: {a.get('cim_rovid', '')}", hatarido, "", reszletek)
 
     lines = [
         "🏛 <b>MNV EAR INGATLAN TALÁLAT</b>",
@@ -710,7 +721,6 @@ def build_mnv_ear_message(a: dict) -> str:
         "",
         "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
         f"🏷 <b>Tétel:</b> {tetel}",
-        # A 'Cím:' sor itt ki van hagyva
         "",
         "💰 <b>2. Pénzügyi Információk</b>",
         f"💵 <b>Kikiáltási ár:</b> {ar}",
@@ -720,7 +730,10 @@ def build_mnv_ear_message(a: dict) -> str:
     ]
 
     if hatarido:
-        lines.append(f"⏰ <b>Biztosíték határideje:</b> {hatarido}")
+        if hatarido_url:
+            lines.append(f"⏰ <b>Biztosíték határideje:</b> <a href='{hatarido_url}'>{hatarido}</a>")
+        else:
+            lines.append(f"⏰ <b>Biztosíték határideje:</b> {hatarido}")
 
     if kezdet_url:
         lines.append(f"▶️ <b>Kezdés:</b> <a href='{kezdet_url}'>{kezdet}</a>")
@@ -732,9 +745,10 @@ def build_mnv_ear_message(a: dict) -> str:
     else:
         lines.append(f"🏁 <b>Befejezés:</b> {befejezes}")
 
+    # MÓDOSÍTVA: dinamikus link használata
     lines.extend([
         "",
-        "🔗 <a href='https://ear.mnv.hu'>Megnyitás az MNV EAR rendszerben</a>",
+        f"🔗 <a href='{auction_link}'>Megnyitás az MNV EAR rendszerben</a>",
     ])
 
     return "\n".join(lines)
@@ -768,7 +782,7 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
             "chat_id": target_chat_id,
             "text": caption,
             "parse_mode": "HTML",
-            "disable_web_page_preview": True,    # MÓDOSÍTVA: linkelőnézet kikapcsolva
+            "disable_web_page_preview": True,    # linkelőnézet kikapcsolva
         }
         resp = requests.post(url, data=data, timeout=20)
         if resp.status_code == 200:
