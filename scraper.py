@@ -36,6 +36,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+# ------------------- SZŰRŐK (BÁRMIKOR MÓDOSÍTHATÓ) -------------------
+# Ingatlan szűrő: True esetén CSAK az 1/1 tulajdoni hányaddal rendelkező ingatlanok mennek át.
+# Ha szeretnéd a többit is látni, állítsd False-ra.
+CSAK_1_1_TULAJDON = True  
+
+# Ingóság szűrő: Csak a megadott HUF érték ALATTI becsértékű ingóságokról küld értesítést.
+# Ha ki szeretnéd kapcsolni ezt a korlátot, állítsd None-ra (pl. MAX_INGOSAG_BECSERTEK = None).
+MAX_INGOSAG_BECSERTEK = 2000000  
+
+
 # =================== Látott URL-ek kezelése ===================
 
 def load_seen_urls() -> set:
@@ -71,6 +81,35 @@ def escape_html(text):
     return str(text).replace("&", "&").replace("<", "<").replace(">", ">")
 
 
+def parse_price_to_int(price_str):
+    """Szöveges árból (pl. '2 500 000 HUF') tiszta egészet csinál az összehasonlításhoz."""
+    if not price_str:
+        return 0
+    cleaned = re.sub(r'[^\d]', '', price_str.replace('\xa0', ''))
+    return int(cleaned) if cleaned else 0
+
+
+def calculate_darabar(price_str, db_str):
+    """Kiszámolja a darabárat, ha a darabszám meg van adva és > 1."""
+    if not price_str or not db_str:
+        return None
+    try:
+        p_clean = price_str.replace(" ", "").replace("\xa0", "")
+        p_match = re.search(r"(\d+)", p_clean)
+        d_clean = db_str.replace(" ", "").replace("\xa0", "")
+        d_match = re.search(r"(\d+)", d_clean)
+        
+        if p_match and d_match:
+            price = int(p_match.group(1))
+            db = int(d_match.group(1))
+            if db > 1:
+                darabar = round(price / db)
+                return f"{darabar:,} HUF/db".replace(",", " ")
+    except Exception as e:
+        logger.warning(f"Nem sikerült a darabárat kiszámolni: {e}")
+    return None
+
+
 def remove_sablon_szoveg(text):
     """Eltávolítja a NAV-os sablonszövegeket a leírásból."""
     if not text:
@@ -86,28 +125,6 @@ def remove_sablon_szoveg(text):
         text = text.replace(s, "")
         
     return " ".join(text.split()).strip()
-
-
-def calculate_darabar(price_str, db_str):
-    """Kiszámolja a darabárat, ha a darabszám meg van adva és > 1."""
-    if not price_str or not db_str:
-        return None
-    try:
-        # Szóközök és nem törhető szóközök eltávolítása a számokból (pl. "750 000" -> "750000")
-        p_clean = price_str.replace(" ", "").replace("\xa0", "")
-        p_match = re.search(r"(\d+)", p_clean)
-        d_clean = db_str.replace(" ", "").replace("\xa0", "")
-        d_match = re.search(r"(\d+)", d_clean)
-        
-        if p_match and d_match:
-            price = int(p_match.group(1))
-            db = int(d_match.group(1))
-            if db > 1:
-                darabar = round(price / db)
-                return f"{darabar:,} HUF/db".replace(",", " ")
-    except Exception as e:
-        logger.warning(f"Nem sikerült a darabárat kiszámolni: {e}")
-    return None
 
 
 def extract_nav_eaf_links(html_content):
@@ -520,7 +537,7 @@ def build_ingatlan_message(a: dict) -> str:
         f"📋 <b>{arveres_nev}</b>",
         "",
         "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
-        f"🏷 <b>Megnevezés:</b> {ingatlan_nev}",
+        f"🏷 <b>Megnevezés/Cím:</b> {ingatlan_nev}",
         f"📍 <b>Cím:</b> {teljes_cim}",
     ]
 
@@ -648,7 +665,7 @@ def build_ingosag_message(a: dict) -> str:
         f"📉 <b>Minimál ajánlat:</b> {minimal_ajanlat}",
     ])
     
-    # Ha sikeres volt a darabár számítás, hozzáfűzzük a pénzügyi szekció aljához
+    # Ha van számolható darabár, megjelenítjük a minimál ajánlat alatt
     if darabar:
         lines.append(f"💲 <b>Minimum darabár:</b> {darabar}")
 
@@ -710,6 +727,21 @@ def main():
             (a.get("kategoria") or "") + " " + (a.get("kategoria_reszletes") or "")
         ).lower()
         is_real_estate = "ingatlan" in kategoria_szoveg
+
+        # ---- SZŰRÉSI LOGIKA ALKALMAZÁSA ----
+        if is_real_estate:
+            if CSAK_1_1_TULAJDON:
+                tulajdon = a.get("tulajdoni_hanyad", "")
+                if "1/1" not in tulajdon:
+                    logger.info(f"-> [SZŰRŐ] Ingatlan kihagyva (Nem 1/1 tulajdon): {a.get('teljes_cim')} ({tulajdon})")
+                    continue
+        else:
+            if MAX_INGOSAG_BECSERTEK is not None:
+                becsertek_int = parse_price_to_int(a.get("becsertek", ""))
+                if becsertek_int > MAX_INGOSAG_BECSERTEK:
+                    logger.info(f"-> [SZŰRŐ] Ingóság kihagyva (Becsérték > {MAX_INGOSAG_BECSERTEK} HUF): {a.get('cim')} ({a.get('becsertek')})")
+                    continue
+        # -------------------------------------
 
         if is_real_estate:
             token = REAL_ESTATE_BOT_TOKEN
