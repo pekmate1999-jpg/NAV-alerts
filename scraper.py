@@ -68,8 +68,8 @@ def normalize_name(name: str) -> str:
     """Eltávolítja a zárójeles részeket, vesszőket, kisbetűsít, törli a felesleges szóközöket."""
     if not name:
         return "ismeretlen"
-    name = re.sub(r'\s*\([^)]*\)', '', name)  # zárójelben lévő rész
-    name = re.sub(r',', '', name)             # vesszők
+    name = re.sub(r'\s*\([^)]*\)', '', name)
+    name = re.sub(r',', '', name)
     name = name.lower()
     name = re.sub(r'\s+', ' ', name).strip()
     return name
@@ -105,14 +105,14 @@ def is_real_estate(auction: dict) -> bool:
 
 def build_safe_caption(group_name: str, items: list) -> str:
     """
-    Összeállít egy caption-t, amely biztosan nem haladja meg a 1024 karaktert,
-    és nem vágja ketté a HTML tag-eket.
-    A leírás (5. pont) hosszát dinamikusan csökkenti, ha szükséges.
+    Biztonságos caption: a leírás hosszát dinamikusan csökkenti,
+    hogy a teljes caption sose haladja meg az 1024 karaktert,
+    és a HTML tag-ek érvényesek maradjanak.
     """
     first = items[0]
     MAX_LEN = 1024
 
-    # 1. Alapadatok blokk (kategória nélkül)
+    # 1. Alapadatok blokk
     base = f"🏛️ <b>{group_name}</b>\n\n"
     base += "📦 <b>1. Tétel alapadatok</b>\n"
     if first.get("allapot"):
@@ -140,8 +140,7 @@ def build_safe_caption(group_name: str, items: list) -> str:
     base += f"🚗 Távolság: {first.get('tavolsag', 'N/A')}\n"
     base += "\n"
 
-    # 5. Leírás – később adjuk hozzá, hogy csökkenthessük
-    # Először összerakjuk a linkeket
+    # Linkek összeállítása
     if len(items) == 1:
         link_part = f"🔗 <a href='{items[0]['url']}'>Részletek megtekintése</a>"
     else:
@@ -149,17 +148,14 @@ def build_safe_caption(group_name: str, items: list) -> str:
         for idx, item in enumerate(items, 1):
             link_part += f"{idx}. <a href='{item['url']}'>Tétel linkje</a>\n"
 
-    # Most megnézzük, mennyi hely marad a leírásnak
+    # Leírás méretének dinamikus beállítása
     desc_text = first.get("egyeb_info", "")
     escaped_desc = html_escape.escape(desc_text)
-    # Ha túl hosszú, rövidítjük
-    max_desc_len = MAX_LEN - len(base) - len(link_part) - 50  # 50 biztonsági tartalék
+    max_desc_len = MAX_LEN - len(base) - len(link_part) - 10  # 10 karakter biztonság
     if max_desc_len < 50:
-        # Ha nagyon kevés hely van, nem küldünk leírást
         desc_part = ""
     else:
         if len(escaped_desc) > max_desc_len:
-            # Levágjuk és hozzáadjuk a "…" jelet
             escaped_desc = escaped_desc[:max_desc_len-3] + "…"
         desc_part = f"📝 <b>5. Leírás</b>\n<i>{escaped_desc}</i>\n\n"
 
@@ -233,7 +229,6 @@ def clean_text(text):
 
 
 def extract_links_from_text(text: str) -> list:
-    """Kinyeri a NAV EAF linkeket sima szöveges tartalomból (reguláris kifejezéssel)."""
     pattern = r'https?://arveres\.nav\.gov\.hu[^\s"\'>]+'
     links = re.findall(pattern, text)
     filtered = [link for link in links if 'auctionId' in link or 'item=auctionSummary' in link]
@@ -443,7 +438,6 @@ def parse_nav_eaf_details(url, html_text=None):
 
 
 def extract_html_from_message(msg):
-    """Rekurzívan kinyeri a HTML tartalmat az e-mailből."""
     if msg.is_multipart():
         for part in msg.walk():
             content_type = part.get_content_type()
@@ -516,7 +510,7 @@ def get_unread_nav_emails():
             logger.info(f"NAV e-mail: {subject_str}")
             html_body = extract_html_from_message(msg)
             if not html_body:
-                # Ha nincs HTML, akkor a teljes nyers szöveget használjuk (plain text)
+                # Próbálkozzunk a sima szöveges résszel
                 if msg.is_multipart():
                     for part in msg.walk():
                         if part.get_content_type() == "text/plain" and "attachment" not in str(part.get("Content-Disposition", "")):
@@ -551,7 +545,7 @@ def get_unread_nav_emails():
 # =================== Fő logika ===================
 
 def main():
-    logger.info(f"=== NAV EAF Scraper v2.06 (biztonságos caption, ingatlan javítás) indítás: {datetime.now().strftime('%Y.%m.%d %H:%M')} ===")
+    logger.info(f"=== NAV EAF Scraper v2.06 (biztonságos caption, ingatlan routing) indítás: {datetime.now().strftime('%Y.%m.%d %H:%M')} ===")
 
     seen_urls = load_seen_urls()
     logger.info(f"Már ismert URL-ek száma: {len(seen_urls)}")
