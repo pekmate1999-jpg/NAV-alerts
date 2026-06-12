@@ -458,7 +458,7 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
 
 
 def build_ingatlan_message(a: dict) -> str:
-    """MBVK-stílusú Telegram üzenet ingatlan árverésekhez (Ügyszám nélkül)."""
+    """MBVK-stílusú Telegram üzenet ingatlan árverésekhez (Csak a kitöltött szekciókkal)."""
 
     arveres_nev = escape_html(a.get("kategoria_reszletes") or a.get("kategoria") or "Ingatlan árverés")
     ingatlan_nev = escape_html(a.get("ingatlan_megnevezes") or a.get("cim") or "Ismeretlen")
@@ -473,6 +473,7 @@ def build_ingatlan_message(a: dict) -> str:
     kezdet = escape_html(a.get("kezdet") or "N/A")
     befejezes = escape_html(a.get("befejezes") or "N/A")
     megtekintes_ido = escape_html(a.get("megtekintes_ido") or "")
+    ugyintezesi_szam = escape_html(a.get("ugyintezesi_szam") or "")
 
     tulajdoni_hanyad = escape_html(a.get("tulajdoni_hanyad") or "")
     helyrajzi_szam = escape_html(a.get("helyrajzi_szam") or "")
@@ -486,7 +487,6 @@ def build_ingatlan_message(a: dict) -> str:
 
     bejegyzesek = escape_html(a.get("tulajdoni_lap_bejegyzesek") or "")
     
-    # Sablonszöveg szűrése
     egyeb_info = a.get("egyeb_info") or a.get("egyeb_megjegyzesek") or ""
     egyeb_info = remove_sablon_szoveg(egyeb_info)
     if len(egyeb_info) > 500:
@@ -496,67 +496,94 @@ def build_ingatlan_message(a: dict) -> str:
     lines = [
         f"🏠 <b>NAV INGATLAN TALÁLAT</b>",
         f"📋 <b>{arveres_nev}</b>",
-        "",
-        "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
-        f"🏷 <b>Megnevezés/Cím:</b> {ingatlan_nev}",
-        f"📍 <b>Cím:</b> {teljes_cim}",
+        ""
     ]
 
+    # 1. Elhelyezkedés és Alapadatok szekció
+    sec1_lines = []
+    if ingatlan_nev:
+        sec1_lines.append(f"🏷 <b>Megnevezés/Cím:</b> {ingatlan_nev}")
+    if teljes_cim:
+        sec1_lines.append(f"📍 <b>Cím:</b> {teljes_cim}")
     if megye:
-        lines.append(f"🏛 <b>Megye:</b> {megye}")
+        sec1_lines.append(f"🏛 <b>Megye:</b> {megye}")
     if tavolsag and tavolsag not in ("N/A", "Nem sikerült kiszámítani"):
-        lines.append(f"🗺 <b>Budapest-távolság:</b> {tavolsag}")
+        sec1_lines.append(f"🗺 <b>Budapest-távolság:</b> {tavolsag}")
 
-    lines.append("")
-    lines.append("🏗 <b>2. Az Ingatlan és a Telek Jellemzői</b>")
+    if sec1_lines:
+        lines.append("🌍 <b>1. Elhelyezkedés és Alapadatok</b>")
+        lines.extend(sec1_lines)
+        lines.append("")
 
+    # 2. Az Ingatlan és a Telek Jellemzői szekció
+    sec2_lines = []
     if tulajdoni_hanyad:
-        lines.append(f"📄 <b>Tulajdoni hányad:</b> {tulajdoni_hanyad}")
+        sec2_lines.append(f"📄 <b>Tulajdoni hányad:</b> {tulajdoni_hanyad}")
     if helyrajzi_szam:
-        lines.append(f"🔢 <b>Helyrajzi szám:</b> {helyrajzi_szam}")
+        sec2_lines.append(f"🔢 <b>Helyrajzi szám:</b> {helyrajzi_szam}")
     if terulet:
-        lines.append(f"📐 <b>Terület:</b> {terulet}")
+        sec2_lines.append(f"📐 <b>Terület:</b> {terulet}")
     if megkozelithetoseg:
-        lines.append(f"🛤 <b>Megközelíthetőség:</b> {megkozelithetoseg}")
+        sec2_lines.append(f"🛤 <b>Megközelíthetőség:</b> {megkozelithetoseg}")
     if beepitheto:
-        lines.append(f"🏗 <b>Beépíthető:</b> {beepitheto}")
+        sec2_lines.append(f"🏗 <b>Beépíthető:</b> {beepitheto}")
     if kerites:
         kerites_str = kerites
         if kerites_anyaga:
             kerites_str += f" ({kerites_anyaga})"
-        lines.append(f"🚧 <b>Kerítés:</b> {kerites_str}")
+        sec2_lines.append(f"🚧 <b>Kerítés:</b> {kerites_str}")
     if talaj:
-        lines.append(f"🌱 <b>Talaj:</b> {talaj}")
+        sec2_lines.append(f"🌱 <b>Talaj:</b> {talaj}")
     if novenyzet:
-        lines.append(f"🌿 <b>Növényzet:</b> {novenyzet}")
+        sec2_lines.append(f"🌿 <b>Növényzet:</b> {novenyzet}")
 
-    lines.append("")
-    lines.append("💰 <b>3. Pénzügyi Információk</b>")
-    lines.append(f"💵 <b>Becsérték:</b> {becsertek}")
-    lines.append(f"📉 <b>Minimál ajánlat:</b> {minimal_ajanlat}")
+    if sec2_lines:
+        lines.append("🏗 <b>2. Az Ingatlan és a Telek Jellemzői</b>")
+        lines.extend(sec2_lines)
+        lines.append("")
+
+    # 3. Pénzügyi Információk szekció
+    sec3_lines = []
+    if becsertek and becsertek != "N/A":
+        sec3_lines.append(f"💵 <b>Becsérték:</b> {becsertek}")
+    if minimal_ajanlat and minimal_ajanlat != "N/A":
+        sec3_lines.append(f"📉 <b>Minimál ajánlat:</b> {minimal_ajanlat}")
     if arveres_eloleg:
         eloleg_match = re.search(r"(\d[\d\s]*(?:HUF|Ft))", a.get("arveres_eloleg", ""))
         if eloleg_match:
-            lines.append(f"💳 <b>Árverési előleg:</b> {escape_html(eloleg_match.group(1))}")
+            sec3_lines.append(f"💳 <b>Árverési előleg:</b> {escape_html(eloleg_match.group(1))}")
 
-    lines.append("")
-    lines.append("⚖️ <b>4. Jogi és Árverési Státusz</b>")
-    lines.append(f"▶️ <b>Árverés kezdete:</b> {kezdet}")
-    lines.append(f"🏁 <b>Árverés vége:</b> {befejezes}")
+    if sec3_lines:
+        lines.append("💰 <b>3. Pénzügyi Információk</b>")
+        lines.extend(sec3_lines)
+        lines.append("")
+
+    # 4. Jogi és Árverési Státusz szekció
+    sec4_lines = []
+    if ugyintezesi_szam:
+        sec4_lines.append(f"📁 <b>Ügyszám:</b> {ugyintezesi_szam}")
+    if kezdet and kezdet != "N/A":
+        sec4_lines.append(f"▶️ <b>Árverés kezdete:</b> {kezdet}")
+    if befejezes and befejezes != "N/A":
+        sec4_lines.append(f"🏁 <b>Árverés vége:</b> {befejezes}")
     if megtekintes_ido:
-        lines.append(f"🕒 <b>Megtekintés:</b> {megtekintes_ido}")
+        sec4_lines.append(f"🕒 <b>Megtekintés:</b> {megtekintes_ido}")
+
+    if sec4_lines:
+        lines.append("⚖️ <b>4. Jogi és Árverési Státusz</b>")
+        lines.extend(sec4_lines)
+        lines.append("")
 
     if bejegyzesek:
-        lines.append("")
         lines.append("📜 <b>Bejegyzések a tulajdoni lapon:</b>")
         lines.append(f"<i>{bejegyzesek}</i>")
+        lines.append("")
 
     if egyeb_info:
-        lines.append("")
         lines.append("📝 <b>Leírás:</b>")
         lines.append(f"<i>{egyeb_info}</i>")
+        lines.append("")
 
-    lines.append("")
     lines.append(f"🔗 <a href='{a.get('url', '')}'>Részletek a NAV oldalon</a>")
     if a.get("maps_url"):
         lines.append(f"🗺 <a href='{a.get('maps_url')}'>Google Térkép</a>")
@@ -565,7 +592,7 @@ def build_ingatlan_message(a: dict) -> str:
 
 
 def build_ingosag_message(a: dict) -> str:
-    """Ingóság árverési Telegram üzenet (Ügyszám nélkül)."""
+    """Ingóság árverési Telegram üzenet (Csak a kitöltött szekciókkal)."""
 
     arveres_nev = escape_html(a.get("kategoria_reszletes") or a.get("kategoria") or "Árverés")
     tetel_nev = escape_html(a.get("cim") or "Ismeretlen tétel")
@@ -578,12 +605,12 @@ def build_ingosag_message(a: dict) -> str:
     megye = escape_html(a.get("megye") or "")
     tavolsag = a.get("tavolsag", "")
     megtekintes_ido = escape_html(a.get("megtekintes_ido") or "")
+    ugyintezesi_szam = escape_html(a.get("ugyintezesi_szam") or "")
 
     teljes_cim = escape_html(
         a.get("teljes_cim") or a.get("megtekintes_hely") or "Ismeretlen helyszín"
     )
 
-    # Sablonszöveg szűrése
     egyeb_info = a.get("egyeb_info") or ""
     egyeb_info = remove_sablon_szoveg(egyeb_info)
     if len(egyeb_info) > 400:
@@ -593,41 +620,71 @@ def build_ingosag_message(a: dict) -> str:
     lines = [
         f"🔔 <b>NAV INGÓSÁG TALÁLAT</b>",
         f"📋 <b>{arveres_nev}</b>",
-        "",
-        "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
-        f"🏷 <b>Tétel:</b> {tetel_nev}",
-        f"📍 <b>Helyszín:</b> {teljes_cim}",
+        ""
     ]
 
+    # 1. Elhelyezkedés és Alapadatok szekció
+    sec1_lines = []
+    if tetel_nev:
+        sec1_lines.append(f"🏷 <b>Tétel:</b> {tetel_nev}")
+    if teljes_cim:
+        sec1_lines.append(f"📍 <b>Helyszín:</b> {teljes_cim}")
     if megye:
-        lines.append(f"🏛 <b>Megye:</b> {megye}")
+        sec1_lines.append(f"🏛 <b>Megye:</b> {megye}")
     if tavolsag and tavolsag not in ("N/A", "Nem sikerült kiszámítani"):
-        lines.append(f"🗺 <b>Budapest-távolság:</b> {tavolsag}")
+        sec1_lines.append(f"🗺 <b>Budapest-távolság:</b> {tavolsag}")
 
-    lines.append("")
-    lines.append("📦 <b>2. A Tétel Jellemzői</b>")
+    if sec1_lines:
+        lines.append("🌍 <b>1. Elhelyezkedés és Alapadatok</b>")
+        lines.extend(sec1_lines)
+        lines.append("")
+
+    # 2. A Tétel Jellemzői szekció
+    sec2_lines = []
     if allapot:
-        lines.append(f"🚪 <b>Állapot:</b> {allapot}")
+        sec2_lines.append(f"🚪 <b>Állapot:</b> {allapot}")
     if darabszam:
-        lines.append(f"🔢 <b>Darabszám:</b> {darabszam}")
+        sec2_lines.append(f"🔢 <b>Darabszám:</b> {darabszam}")
 
-    lines.extend([
-        "",
-        "💰 <b>3. Pénzügyi Információk</b>",
-        f"💵 <b>Becsérték:</b> {becsertek}",
-        f"📉 <b>Minimál ajánlat:</b> {minimal_ajanlat}",
-        "",
-        "📅 <b>4. Időpontok és Árverési Státusz</b>",
-    ])
-    lines.append(f"▶️ <b>Kezdés:</b> {kezdet}")
-    lines.append(f"🏁 <b>Befejezés:</b> {befejezes}")
+    if sec2_lines:
+        lines.append("📦 <b>2. A Tétel Jellemzői</b>")
+        lines.extend(sec2_lines)
+        lines.append("")
+
+    # 3. Pénzügyi Információk szekció
+    sec3_lines = []
+    if becsertek and becsertek != "N/A":
+        sec3_lines.append(f"💵 <b>Becsérték:</b> {becsertek}")
+    if minimal_ajanlat and minimal_ajanlat != "N/A":
+        sec3_lines.append(f"📉 <b>Minimál ajánlat:</b> {minimal_ajanlat}")
+
+    if sec3_lines:
+        lines.append("💰 <b>3. Pénzügyi Információk</b>")
+        lines.extend(sec3_lines)
+        lines.append("")
+
+    # 4. Időpontok és Árverési Státusz szekció
+    sec4_lines = []
+    if ugyintezesi_szam:
+        sec4_lines.append(f"📁 <b>Ügyszám:</b> {ugyintezesi_szam}")
+    if kezdet and kezdet != "N/A":
+        sec4_lines.append(f"▶️ <b>Kezdés:</b> {kezdet}")
+    if befejezes and befejezes != "N/A":
+        sec4_lines.append(f"🏁 <b>Befejezés:</b> {befejezes}")
     if megtekintes_ido:
-        lines.append(f"🕒 <b>Megtekintés:</b> {megtekintes_ido}")
+        sec4_lines.append(f"🕒 <b>Megtekintés:</b> {megtekintes_ido}")
+
+    if sec4_lines:
+        lines.append("📅 <b>4. Időpontok és Árverési Státusz</b>")
+        lines.extend(sec4_lines)
+        lines.append("")
 
     if egyeb_info:
-        lines.extend(["", "📝 <b>Leírás:</b>", f"<i>{egyeb_info}</i>"])
+        lines.append("📝 <b>Leírás:</b>")
+        lines.append(f"<i>{egyeb_info}</i>")
+        lines.append("")
 
-    lines.extend(["", f"🔗 <a href='{a.get('url', '')}'>Részletek a NAV oldalon</a>"])
+    lines.append(f"🔗 <a href='{a.get('url', '')}'>Részletek a NAV oldalon</a>")
     if a.get("maps_url"):
         lines.append(f"🗺 <a href='{a.get('maps_url')}'>Google Térkép</a>")
 
