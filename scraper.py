@@ -9,27 +9,26 @@ from telegram import Bot
 from datetime import datetime, timezone, timedelta
 import logging
 import io
-import asyncio  # Szükséges az aszinkron futáshoz
+import asyncio
 
-# ------------------- Konfiguráció -------------------
+# ------------------- Konfiguráció (ÚJ SECRETS) -------------------
 EMAIL = os.environ.get("EMAIL_ADDRESS")
 PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
+
+# Áthangolva a Real Estate (MBVK) botra és csatornára
+BOT_TOKEN = os.environ.get("REALESTATE_BOT_TOKEN")
+CHAT_ID = os.environ.get("REALESTATE_CHAT_ID")
 
 # Budapest XVII. ker. Sáránd utca közelítő koordinátái (kiindulópont a távolsághoz)
 ORIGIN_LAT = 47.4344
 ORIGIN_LON = 19.2198
-ORIGIN_LABEL = "Budapest XVII. ker. Sáránd utca"
 
-# ------------------- Látott URL-ek tárolója -------------------
 SEEN_URLS_FILE = os.path.join(os.path.dirname(__file__), "seen_urls.json")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
-
 
 # =================== Látott URL-ek kezelése ===================
 
@@ -49,26 +48,12 @@ def save_seen_urls(seen: set):
     try:
         with open(SEEN_URLS_FILE, "w", encoding="utf-8") as f:
             json.dump({"seen_urls": sorted(seen)}, f, ensure_ascii=False, indent=2)
-        logger.info(f"Látott URL-ek mentve: {len(seen)} db → {SEEN_URLS_FILE}")
     except Exception as e:
         logger.error(f"Látott URL-ek mentési hiba: {e}")
 
 
 def filter_new_auctions(auctions: list, seen: set) -> list:
-    new = [a for a in auctions if a.get("url") and a["url"] not in seen]
-    logger.info(f"Szűrés: {len(auctions)} árverésből {len(new)} új (még nem küldött).")
-    return new
-
-
-# =================== Csoportosítás ===================
-
-def group_auctions_by_category(auctions: list) -> dict:
-    groups = {}
-    for a in auctions:
-        cat = a.get("kategoria_reszletes") or a.get("kategoria") or "Egyéb"
-        cat_key = cat.split(" - ")[0].strip() if " - " in cat else cat
-        groups.setdefault(cat_key, []).append(a)
-    return dict(sorted(groups.items(), key=lambda x: -len(x[1])))
+    return [a for a in auctions if a.get("url") and a["url"] not in seen]
 
 
 # =================== Segédfüggvények ===================
@@ -92,9 +77,7 @@ def extract_nav_eaf_links(html_content):
 
 def simplify_address(address):
     import re
-    candidates = []
-    candidates.append(address)
-
+    candidates = [address]
     cleaned = re.sub(r",?\s*\d+(/\d+)?\s*hrsz\.?", "", address, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(külterület|belterület|tanya)\b", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip().rstrip(",").strip()
@@ -106,18 +89,6 @@ def simplify_address(address):
         city_only = city_match.group(1).strip()
         if city_only not in candidates:
             candidates.append(city_only)
-
-    zip_match = re.match(r"(\d{4})", address)
-    if zip_match:
-        zip_candidate = zip_match.group(1) + ", Magyarország"
-        if zip_candidate not in candidates:
-            candidates.append(zip_candidate)
-
-    seen = []
-    for c in candidates:
-        c = c.strip()
-        if c and c not in seen:
-            seen.append(c)
     return seen
 
 
@@ -125,26 +96,16 @@ def geocode_address(address):
     import time
     candidates = simplify_address(address)
     headers = {"User-Agent": "NAV-EAF-Scraper/1.0"}
-
     for candidate in candidates:
         try:
             params = {"q": candidate, "format": "json", "limit": 1, "countrycodes": "hu"}
             resp = requests.get("https://nominatim.openstreetmap.org/search", params=params, headers=headers, timeout=10)
-            resp.raise_for_status()
-            results = resp.json()
-            if results:
-                lat = float(results[0]["lat"])
-                lon = float(results[0]["lon"])
-                logger.info(f"Geocode OK: '{candidate}' → ({lat}, {lon})")
-                return lat, lon
-            else:
-                logger.info(f"Geocode: nincs találat: '{candidate}', következő próba...")
+            if resp.status_code == 200 and resp.json():
+                results = resp.json()
+                return float(results[0]["lat"]), float(results[0]["lon"])
             time.sleep(1.1)
-        except Exception as e:
-            logger.error(f"Geocode hiba ('{candidate}'): {e}")
+        except Exception:
             time.sleep(1.1)
-
-    logger.warning(f"Geocode: minden próba sikertelen: '{address}'")
     return None
 
 
@@ -153,22 +114,15 @@ def get_drive_distance(dest_address):
     if not coords:
         return None
     dest_lat, dest_lon = coords
-
     try:
-        url = f"http://router.project-osrm.org/route/v1/driving/{ORIGIN_LON},{ORIGIN_LAT};{dest_lon},{dest_lat}?overview=false"
+        url = f"http://router.project-osrm.org/route/v1/driving/{dest_lon},{dest_lat};{ORIGIN_LON},{ORIGIN_LAT}?overview=false"
         resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") == "Ok" and data.get("routes"):
-            route = data["routes"][0]
-            km = round(route["distance"] / 1000, 1)
-            minutes = round(route["duration"] / 60)
-            return km, minutes
-        else:
-            logger.warning(f"OSRM: nem sikerült útvonalat számítani: {data.get('code')}")
-            return None
-    except Exception as e:
-        logger.error(f"OSRM hiba: {e}")
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("routes"):
+                route = data["routes"][0]
+                return round(route["distance"] / 1000, 1), round(route["duration"] / 60)
+    except Exception:
         return None
 
 
@@ -179,165 +133,84 @@ def scrape_main_image(url, soup):
             fullurl = img_tag.get("fullurl", "").strip()
             if not fullurl:
                 continue
-            if fullurl.startswith("http"):
-                image_url = fullurl
-            elif fullurl.startswith("/"):
-                image_url = "https://arveres.nav.gov.hu" + fullurl
-            else:
-                image_url = BASE + fullurl
-            logger.info(f"Kép URL: {image_url}")
-            return image_url
-        logger.warning("Nem található kép.")
-        return None
-    except Exception as e:
-        logger.error(f"Kép scrape hiba: {e}")
+            return fullurl if fullurl.startswith("http") else BASE + fullurl.lstrip("/")
+    except Exception:
         return None
 
 
-def download_image(image_url, session=None):
+def download_image(image_url):
     try:
-        req = session or requests
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-        resp = req.get(image_url, timeout=20, headers=headers)
-        resp.raise_for_status()
-        content_type = resp.headers.get("Content-Type", "")
-        if "image" not in content_type:
-            return None
-        return resp.content
-    except Exception as e:
-        logger.error(f"Kép letöltési hiba: {image_url} - {e}")
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(image_url, timeout=20, headers=headers)
+        if "image" in resp.headers.get("Content-Type", ""):
+            return resp.content
+    except Exception:
         return None
 
 
-def parse_nav_eaf_details(url, html_text=None):
-    if html_text is None:
-        try:
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            resp = requests.get(url, timeout=30, headers=headers)
-            resp.raise_for_status()
-            resp.encoding = "ISO-8859-2"
-            html_text = resp.text
-        except Exception as e:
-            logger.error(f"Hiba a NAV EAF oldal betöltésekor: {url} - {e}")
-            return None
+def parse_nav_eaf_details(url):
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, timeout=30, headers=headers)
+        resp.encoding = "ISO-8859-2"
+        html_text = resp.text
+    except Exception:
+        return None
 
     soup = BeautifulSoup(html_text, "html.parser")
     data = {"url": url}
 
-    alapadatok_table = None
+    # Táblázatok feldolgozása
     for div in soup.find_all("div", class_="FrissPortlet"):
         header = div.find("div", class_="HeaderTitle")
-        if header and "Árverés alapadatok" in header.get_text():
-            alapadatok_table = div.find("table", class_="DownloadAppsList")
-            break
-
-    if alapadatok_table:
-        rows = alapadatok_table.find_all("tr", class_="Bg2")
-        for row in rows:
-            cells = row.find_all("td")
-            if len(cells) >= 2:
-                key = clean_text(cells[0].get_text())
-                value = clean_text(cells[1].get_text())
-                if "Árverés megnevezése" in key:
-                    data["kategoria"] = value
-                elif "Végrehajtási ügyszám" in key:
-                    data["ugyintezesi_szam"] = value
-                elif "Árverés kategória" in key:
-                    data["kategoria_reszletes"] = value
-                elif "Árverés sorszáma" in key:
-                    data["sorszam"] = value
-                elif "Árverés meghirdetése" in key:
-                    data["meghirdetes"] = value
-                elif "Árverés kezdete" in key:
-                    data["kezdet"] = value
-                elif "Árverés befejezése" in key:
-                    data["befejezes"] = value
-                elif "Ügyintéző telefon" in key:
-                    data["telefon"] = value
-                elif "Az árverezett tétel megtekinthető, hely" in key:
-                    data["megtekintes_hely"] = value
-                elif "Az árverezett tétel megtekinthető, idő" in key:
-                    data["megtekintes_ido"] = value
-
-    tetel_table = None
-    for div in soup.find_all("div", class_="FrissPortlet"):
-        header = div.find("div", class_="HeaderTitle")
-        if header and "Árverezett tétel adatok" in header.get_text():
-            tetel_table = div.find("table", class_="DownloadAppsList")
-            break
-
-    if tetel_table:
-        rows = tetel_table.find_all("tr", class_="Bg2")
-        for row in rows:
-            cells = row.find_all("td")
-            if len(cells) >= 2:
-                key = clean_text(cells[0].get_text())
-                value = clean_text(cells[1].get_text())
-                if "Tétel megnevezése" in key:
-                    data["tetel_megnevezes"] = value
-                elif "Becsérték" in key:
-                    data["becsertek"] = value
-                elif "Minimál ajánlat" in key:
-                    data["minimal_ajanlat"] = value
-                elif "Egyszerre árverezett tétel darabszám" in key:
-                    data["darabszam"] = value
-                elif "Állapot" in key:
-                    data["allapot"] = value
-                elif "Egyéb infó" in key:
-                    data["egyeb_info"] = value
+        if not header:
+            continue
+        header_text = header.get_text()
+        
+        if "Árverés alapadatok" in header_text or "Árverezett tétel adatok" in header_text:
+            table = div.find("table", class_="DownloadAppsList")
+            if table:
+                for row in table.find_all("tr", class_="Bg2"):
+                    cells = row.find_all("td")
+                    if len(cells) >= 2:
+                        key = clean_text(cells[0].get_text())
+                        value = clean_text(cells[1].get_text())
+                        if "Árverés megnevezése" in key: data["kategoria"] = value
+                        elif "Árverés kategória" in key: data["kategoria_reszletes"] = value
+                        elif "Árverés kezdete" in key: data["kezdet"] = value
+                        elif "Árverés befejezése" in key: data["befejezes"] = value
+                        elif "Az árverezett tétel megtekinthető, hely" in key: data["megtekintes_hely"] = value
+                        elif "Tétel megnevezése" in key: data["tetel_megnevezes"] = value
+                        elif "Becsérték" in key: data["becsertek"] = value
+                        elif "Minimál ajánlat" in key: data["minimal_ajanlat"] = value
+                        elif "Állapot" in key: data["allapot"] = value
+                        elif "Egyéb infó" in key: data["egyeb_info"] = value
 
     data["image_url"] = scrape_main_image(url, soup)
 
     megtekintes_hely = data.get("megtekintes_hely", "")
     if megtekintes_hely:
         result = get_drive_distance(megtekintes_hely)
-        if result:
-            km, minutes = result
-            data["tavolsag"] = f"{km} km ({minutes} perc autóval)"
-        else:
-            data["tavolsag"] = "Nem sikerült kiszámítani"
+        data["tavolsag"] = f"{result[0]} km ({result[1]} perc)" if result else "Nem sikerült kiszámítani"
     else:
         data["tavolsag"] = "N/A"
 
-    if "tetel_megnevezes" in data:
-        data["cim"] = data["tetel_megnevezes"]
-    elif "kategoria_reszletes" in data:
-        data["cim"] = data["kategoria_reszletes"]
-    else:
-        data["cim"] = "Ismeretlen tétel"
-
-    data["jelenlegi_ar"] = data.get("becsertek", "N/A")
+    data["cim"] = data.get("tetel_megnevezes") or data.get("kategoria_reszletes") or "Ismeretlen ingatlan"
     return data
 
 
 def extract_html_from_message(msg):
     if msg.is_multipart():
         for part in msg.walk():
-            content_type = part.get_content_type()
-            content_disposition = str(part.get("Content-Disposition", ""))
-            if content_type == "text/html" and "attachment" not in content_disposition:
+            if part.get_content_type() == "text/html":
                 payload = part.get_payload(decode=True)
                 if payload:
-                    charset = part.get_content_charset() or "utf-8"
-                    return payload.decode(charset, errors="ignore")
-            elif content_type == "message/rfc822":
-                inner_payload = part.get_payload()
-                if isinstance(inner_payload, list):
-                    for inner_msg in inner_payload:
-                        result = extract_html_from_message(inner_msg)
-                        if result:
-                            return result
-                elif isinstance(inner_payload, bytes):
-                    inner_msg = email.message_from_bytes(inner_payload)
-                    result = extract_html_from_message(inner_msg)
-                    if result:
-                        return result
+                    return payload.decode(part.get_content_charset() or "utf-8", errors="ignore")
     else:
         if msg.get_content_type() == "text/html":
             payload = msg.get_payload(decode=True)
             if payload:
-                charset = msg.get_content_charset() or "utf-8"
-                return payload.decode(charset, errors="ignore")
+                return payload.decode(msg.get_content_charset() or "utf-8", errors="ignore")
     return None
 
 
@@ -347,155 +220,79 @@ def get_emails_since(since_date):
         mail.login(EMAIL, PASSWORD)
         mail.select("inbox")
 
-        # JAVÍTÁS: Csak az olvasatlan leveleket keresi (UNSEEN)
         search_criteria = f'(UNSEEN SINCE "{since_date.strftime("%d-%b-%Y")}")'
         status, messages = mail.search(None, search_criteria)
         if status != "OK" or not messages[0]:
-            logger.info("Nincs új olvasatlan e-mail a megadott időszakban.")
             return []
 
-        email_ids = messages[0].split()
         result = []
-        for eid in email_ids:
+        for eid in messages[0].split():
             status, msg_data = mail.fetch(eid, "(RFC822)")
-            if status != "OK":
-                continue
-            raw_email = msg_data[0][1]
-            msg = email.message_from_bytes(raw_email)
-
-            from_ = msg.get("From", "")
+            if status != "OK": continue
+            msg = email.message_from_bytes(msg_data[0][1])
+            
             subject_parts = decode_header(msg.get("Subject", ""))
-            subject_str = ""
-            for part, enc in subject_parts:
-                if isinstance(part, bytes):
-                    part = part.decode(enc or "utf-8", errors="ignore")
-                subject_str += part
-
-            is_nav = (
-                any(sender in from_ for sender in ["-eaf@nav.gov.hu", "eaf@nav.gov.hu"])
-                or "Elektronikus Árverés" in subject_str
-                or "Elektronikus Arveres" in subject_str
-            )
-
-            if not is_nav:
-                continue
-
-            html_body = extract_html_from_message(msg)
-            if html_body:
-                result.append(html_body)
-
-            # Olvasottá tétel feldolgozás után
+            subject_str = "".join([p.decode(e or "utf-8", errors="ignore") if isinstance(p, bytes) else p for p, e in subject_parts])
+            
+            if "Elektronikus Árverés" in subject_str or "Elektronikus Arveres" in subject_str:
+                html_body = extract_html_from_message(msg)
+                if html_body:
+                    result.append(html_body)
             mail.store(eid, "+FLAGS", "\\Seen")
-
+        
         mail.close()
         mail.logout()
         return result
     except Exception as e:
-        logger.exception(f"IMAP hiba: {e}")
+        logger.error(f"IMAP hiba: {e}")
         return []
 
 
-# =================== JAVÍTÁS: ASZINKRON TELEGRAM KÜLDÉS ===================
+# =================== IDEIGLENES MBVK-STÍLUSÚ PAPSÁG ===================
 
-async def send_auction_message(idx: int, a: dict):
-    caption = f"🏛️ <b>{a.get('cim', 'Cím nélkül')}</b>\n\n"
-
-    caption += "📦 <b>1. Tétel alapadatok</b>\n"
-    caption += f"🏷️ Kategória: {a.get('kategoria_reszletes', 'N/A')}\n"
-    caption += f"📊 Állapot: {a.get('allapot', 'N/A')}\n"
-    if a.get("darabszam"):
-        caption += f"🔢 Darabszám: {a.get('darabszam')}\n"
-    caption += "\n"
-
-    caption += "💰 <b>2. Pénzügyi információk</b>\n"
-    caption += f"💵 Becsérték: {a.get('becsertek', 'N/A')}\n"
-    caption += f"💸 Minimál ajánlat: {a.get('minimal_ajanlat', 'N/A')}\n"
-    caption += "\n"
-
-    caption += "📅 <b>3. Időpontok</b>\n"
-    caption += f"▶️ Kezdés: {a.get('kezdet', 'N/A')}\n"
-    caption += f"⏹️ Befejezés: {a.get('befejezes', 'N/A')}\n"
-    caption += "\n"
-
-    caption += "📍 <b>4. Megtekintés</b>\n"
-    caption += f"🗺️ Helyszín: {a.get('megtekintes_hely', 'N/A')}\n"
-    caption += f"🕐 Időpont: {a.get('megtekintes_ido', 'N/A')}\n"
-    caption += f"🚗 Távolság: {a.get('tavolsag', 'N/A')}\n"
-    caption += "\n"
-
+async def send_auction_message(a: dict):
+    # Az MBVK botokhoz hasonló, letisztultabb struktúra
+    caption = f"🏠 <b>{a.get('cim', 'Ismeretlen ingatlan')}</b>\n\n"
+    
+    caption += f"💰 <b>Becsérték:</b> {a.get('becsertek', 'N/A')}\n"
+    caption += f"📉 <b>Minimálár:</b> {a.get('minimal_ajanlat', 'N/A')}\n\n"
+    
+    caption += f"📅 <b>Kezdet:</b> {a.get('kezdet', 'N/A')}\n"
+    caption += f"⏳ <b>Vége:</b> {a.get('befejezes', 'N/A')}\n\n"
+    
+    caption += f"📍 <b>Helyszín:</b> {a.get('megtekintes_hely', 'N/A')}\n"
+    caption += f"🚗 <b>Távolság (XVII. ker):</b> {a.get('tavolsag', 'N/A')}\n\n"
+    
     if a.get("egyeb_info"):
-        caption += "📝 <b>5. Leírás</b>\n"
-        caption += f"<i>{a['egyeb_info'][:250]}</i>\n\n"
+        caption += f"📝 <b>Leírás:</b> <i>{a['egyeb_info'][:300]}...</i>\n\n"
+        
+    caption += f"🔗 <a href='{a['url']}'>Árverési adatlap megnyitása</a>"
 
-    caption += f"🔗 <a href='{a['url']}'>Részletek megtekintése</a>"
-
-    if len(caption) > 1024:
-        caption = caption[:1020] + "…"
-
-    image_url = a.get("image_url")
-    image_bytes = download_image(image_url) if image_url else None
-    sent = False
-
-    if image_bytes:
-        try:
+    image_bytes = download_image(a.get("image_url")) if a.get("image_url") else None
+    try:
+        if image_bytes:
             await bot.send_photo(chat_id=CHAT_ID, photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
-            sent = True
-        except Exception as e:
-            logger.warning(f"Kép küldés (bytes) sikertelen: {e}")
-
-    if not sent and image_url:
-        try:
-            await bot.send_photo(chat_id=CHAT_ID, photo=image_url, caption=caption, parse_mode="HTML")
-            sent = True
-        except Exception as e:
-            logger.warning(f"Kép küldés (URL) sikertelen: {e}")
-
-    if not sent:
-        try:
-            await bot.send_message(chat_id=CHAT_ID, text=caption, parse_mode="HTML", disable_web_page_preview=False)
-        except Exception as e:
-            logger.error(f"Telegram szöveges küldés is sikertelen ({a.get('cim', '?')}): {e}")
+        else:
+            await bot.send_message(chat_id=CHAT_ID, text=caption, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"Hiba az üzenetküldésnél: {e}")
 
 
 async def send_telegram_messages(auctions: list):
     if not auctions:
-        await bot.send_message(
-            chat_id=CHAT_ID,
-            text="📭 Nincs új NAV EAF árverési értesítő (minden már ismert).",
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
         return
-
-    groups = group_auctions_by_category(auctions)
-    total = sum(len(v) for v in groups.values())
-
-    summary = (
-        f"🔔 <b>Új NAV EAF árverések</b>\n"
-        f"📊 Összesen: <b>{total} új tétel</b>\n"
-        f"🕐 {datetime.now().strftime('%Y.%m.%d %H:%M')}"
-    )
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text=summary, parse_mode="HTML", disable_web_page_preview=True)
-    except Exception as e:
-        logger.error(f"Összefoglaló fejléc küldési hiba: {e}")
-
-    # MÓDOSÍTÁS: Kivettük a send_group_header hívásokat, így tisztán csak a tételek mennek ki
-    for category, items in groups.items():
-        for idx, a in enumerate(items, 1):
-            await send_auction_message(idx, a)
+    for a in auctions:
+        await send_auction_message(a)
 
 
 # =================== Fő logika ===================
 
 def main():
     since = datetime.now(timezone.utc) - timedelta(days=1)
-    logger.info(f"=== NAV EAF Scraper v1.02 indítás ===")
-
     seen_urls = load_seen_urls()
+    
     emails_html = get_emails_since(since)
     if not emails_html:
-        asyncio.run(send_telegram_messages([]))
         return
 
     all_auctions = []
@@ -507,8 +304,16 @@ def main():
                 all_auctions.append(details)
 
     unique = list({a["url"]: a for a in all_auctions}.values())
-    new_auctions = filter_new_auctions(unique, seen_urls)
-
+    
+    # KIZÁRÓLAG INGATLANOK MEGTARTÁSA
+    real_estate_auctions = [
+        a for a in unique 
+        if "ingatlan" in a.get("kategoria", "").lower() 
+        or "ingatlan" in a.get("kategoria_reszletes", "").lower()
+    ]
+    
+    new_auctions = filter_new_auctions(real_estate_auctions, seen_urls)
+    
     asyncio.run(send_telegram_messages(new_auctions))
 
     for a in new_auctions:
