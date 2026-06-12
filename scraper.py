@@ -9,16 +9,13 @@ from telegram import Bot
 from datetime import datetime, timezone, timedelta
 import logging
 import io
-import asyncio
 import re
 
-# ------------------- Konfiguráció (REALESTATE SECRETS) -------------------
+# ------------------- Konfiguráció -------------------
 EMAIL = os.environ.get("EMAIL_ADDRESS")
 PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
-
-# MBVK / Realestate bot hozzáférések
-BOT_TOKEN = os.environ.get("REALESTATE_BOT_TOKEN")
-CHAT_ID = os.environ.get("REALESTATE_CHAT_ID")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
 
 # Budapest XVII. ker. Sáránd utca koordinátái a távolságszámításhoz
 ORIGIN_LAT = 47.4344
@@ -49,6 +46,7 @@ def save_seen_urls(seen: set):
     try:
         with open(SEEN_URLS_FILE, "w", encoding="utf-8") as f:
             json.dump({"seen_urls": sorted(seen)}, f, ensure_ascii=False, indent=2)
+        logger.info(f"Látott URL-ek mentve: {len(seen)} db")
     except Exception as e:
         logger.error(f"Látott URL-ek mentési hiba: {e}")
 
@@ -63,13 +61,11 @@ def clean_text(text):
     return " ".join(text.split()) if text else ""
 
 
-def escape_markdown(text):
-    """Biztonságossá teszi a szöveget a Telegram Markdown V1 parse_mode számára"""
+def escape_html(text):
+    """Biztonságossá teszi a nyers szöveget a Telegram HTML parse_mode számára."""
     if not text:
         return ""
-    for ch in ["*", "_", "`", "["]:
-        text = text.replace(ch, f"\\{ch}")
-    return text
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def extract_nav_eaf_links(html_content):
@@ -98,7 +94,13 @@ def simplify_address(address):
         city_only = city_match.group(1).strip()
         if city_only not in candidates:
             candidates.append(city_only)
-    return candidates
+
+    seen = []
+    for c in candidates:
+        c = c.strip()
+        if c and c not in seen:
+            seen.append(c)
+    return seen
 
 
 def geocode_address(address):
@@ -118,7 +120,10 @@ def geocode_address(address):
     return None
 
 
-def get_drive_distance(dest_lat, dest_lon):
+def get_drive_distance(coords):
+    if not coords:
+        return None
+    dest_lat, dest_lon = coords
     try:
         url = f"http://router.project-osrm.org/route/v1/driving/{ORIGIN_LON},{ORIGIN_LAT};{dest_lon},{dest_lat}?overview=false"
         resp = requests.get(url, timeout=15)
@@ -153,19 +158,20 @@ def download_image(image_url):
         return None
 
 
-def parse_nav_eaf_details(url):
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, timeout=30, headers=headers)
-        resp.encoding = "ISO-8859-2"
-        html_text = resp.text
-    except Exception:
-        return None
+def parse_nav_eaf_details(url, html_text=None):
+    if html_text is None:
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = requests.get(url, timeout=30, headers=headers)
+            resp.encoding = "ISO-8859-2"
+            html_text = resp.text
+        except Exception:
+            return None
 
     soup = BeautifulSoup(html_text, "html.parser")
     data = {"url": url}
 
-    # Intelligens megye-felismerés a forráskódból
+    # Megye kinyerése a forráskódból
     megye_match = re.search(r'([A-ZÁÉÍÓÖŐÚÜŰ][a-záéíóöőúüűA-ZÁÉÍÓÖŐÚÜŰ\-]+)\s+(?:Vár)?megye', html_text)
     if megye_match:
         data["megye"] = megye_match.group(1).strip() + " vármegye"
@@ -186,6 +192,7 @@ def parse_nav_eaf_details(url):
                         key = clean_text(cells[0].get_text())
                         value = clean_text(cells[1].get_text())
                         if "Árverés megnevezése" in key: data["kategoria"] = value
+                        elif "Végrehajtási ügyszám" in key: data["ugyintezesi_szam"] = value
                         elif "Árverés kategória" in key: data["kategoria_reszletes"] = value
                         elif "Árverés kezdete" in key: data["kezdet"] = value
                         elif "Árverés befejezése" in key: data["befejezes"] = value
@@ -193,19 +200,20 @@ def parse_nav_eaf_details(url):
                         elif "Tétel megnevezése" in key: data["tetel_megnevezes"] = value
                         elif "Becsérték" in key: data["becsertek"] = value
                         elif "Minimál ajánlat" in key: data["minimal_ajanlat"] = value
+                        elif "Egyszerre árverezett tétel darabszám" in key: data["darabszam"] = value
                         elif "Állapot" in key: data["allapot"] = value
                         elif "Egyéb infó" in key: data["egyeb_info"] = value
 
     data["image_url"] = scrape_main_image(url, soup)
 
-    # Térkép és távolság számítása
+    # Térkép és optimalizált távolság számítás
     megtekintes_hely = data.get("megtekintes_hely", "")
     if megtekintes_hely:
         coords = geocode_address(megtekintes_hely)
         if coords:
             lat, lon = coords
             data["maps_url"] = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
-            result = get_drive_distance(lat, lon)
+            result = get_drive_distance(coords)
             data["tavolsag"] = f"{result[0]} km ({result[1]} perc autóval)" if result else "Nem sikerült kiszámítani"
         else:
             data["tavolsag"] = "N/A"
@@ -237,7 +245,7 @@ def get_emails_since(since_date):
         mail.login(EMAIL, PASSWORD)
         mail.select("inbox")
 
-        search_criteria = f'(UNSEEN SINCE "{since_date.strftime("%d-%b-%Y")}")'
+        search_criteria = f'(SINCE "{since_date.strftime("%d-%b-%Y")}")'
         status, messages = mail.search(None, search_criteria)
         if status != "OK" or not messages[0]:
             return []
@@ -265,73 +273,99 @@ def get_emails_since(since_date):
         return []
 
 
-# =================== MBVK STÍLUSÚÜZENET ÖSSZEÁLLÍTÁS ===================
+# =================== Üzenet összeállítás (HTML módban) ===================
 
-async def send_auction_message(a: dict):
-    lines = ["🆕 *NAV INGATLAN TALÁLAT*", ""]
+def send_auction_message(idx: int, a: dict):
+    lines = ["🆕 <b>NAV INGATLAN TALÁLAT</b>", ""]
     
     # 1. Elhelyezkedés és Alapadatok
-    lines.append("🌍 *1. Elhelyezkedés és Alapadatok*")
-    lines.append(f"📍 *Cím:* {escape_markdown(a.get('cim', 'N/A'))}")
+    lines.append("🌍 <b>1. Elhelyezkedés és Alapadatok</b>")
+    lines.append(f"📍 <b>Cím:</b> {escape_html(a.get('cim', 'N/A'))}")
     
-    megye_str = escape_markdown(a.get("megye", ""))
+    megye_str = escape_html(a.get("megye", ""))
     if megye_str:
-        lines.append(f"🏛 *Megye:* {megye_str}")
+        lines.append(f"🏛 <b>Megye:</b> {megye_str}")
         
-    dist_str = escape_markdown(a.get("tavolsag", ""))
+    dist_str = escape_html(a.get("tavolsag", ""))
     if dist_str and dist_str != "N/A":
-        lines.append(f"🗺 *Budapest-távolság:* {dist_str}")
+        lines.append(f"🗺 <b>Budapest-távolság:</b> {dist_str}")
     lines.append("")
     
     # 2. Az Ingatlan és a Telek Jellemzői
-    lines.append("🏠 *2. Az Ingatlan és a Telek Jellemzői*")
-    allapot = escape_markdown(a.get("allapot", "igen"))
-    lines.append(f"🚪 *Beköltözhető / Állapot:* {allapot}")
+    lines.append("🏠 <b>2. Az Ingatlan és a Telek Jellemzői</b>")
+    lines.append(f"🚪 <b>Állapot / Beköltözhetőség:</b> {escape_html(a.get('allapot', 'N/A'))}")
+    if a.get("darabszam"):
+        lines.append(f"🔢 <b>Darabszám:</b> {escape_html(a['darabszam'])}")
     lines.append("")
     
     # 3. Pénzügyi Információk
-    lines.append("💰 *3. Pénzügyi Információk*")
-    lines.append(f"💵 *Jelenlegi ár / Becsérték:* {escape_markdown(a.get('becsertek', 'N/A'))}")
-    lines.append(f"📉 *Minimál ajánlat:* {escape_markdown(a.get('minimal_ajanlat', 'N/A'))}")
+    lines.append("💰 <b>3. Pénzügyi Információk</b>")
+    lines.append(f"💵 <b>Becsérték (Jelenlegi ár):</b> {escape_html(a.get('becsertek', 'N/A'))}")
+    lines.append(f"📉 <b>Minimál ajánlat:</b> {escape_html(a.get('minimal_ajanlat', 'N/A'))}")
     lines.append("")
     
     # 4. Jogi és Árverési Státusz
-    lines.append("⚖️ *4. Jogi és Árverési Státusz*")
-    lines.append(f"▶️ *Árverés kezdete:* {escape_markdown(a.get('kezdet', 'N/A'))}")
-    lines.append(f"📅 *Árverés vége:* {escape_markdown(a.get('befejezes', 'N/A'))}")
+    lines.append("⚖️ <b>4. Jogi és Árverési Státusz</b>")
+    lines.append(f"▶️ <b>Árverés kezdete:</b> {escape_html(a.get('kezdet', 'N/A'))}")
+    lines.append(f"📅 <b>Árverés vége:</b> {escape_html(a.get('befejezes', 'N/A'))}")
+    if a.get("ugyintezesi_szam"):
+        lines.append(f"📄 <b>Ügyszám:</b> {escape_html(a['ugyintezesi_szam'])}")
     lines.append("")
     
     # Leírás kezelése
     leiras = a.get("egyeb_info", "")
     if leiras:
-        lines.append(f"📝 *Leírás:*\n_{escape_markdown(leiras[:400])}_")
+        lines.append(f"📝 <b>Leírás:</b>\n<i>{escape_html(leiras[:400])}</i>")
         lines.append("")
         
-    # Linkek formázása
-    lines.append(f"🔗 [Részletek az NAV oldalon]({a.get('url', '')})")
+    # Linkek formázása HTML-ben
+    lines.append(f"🔗 <a href='{a.get('url', '')}'>Részletek a NAV oldalon</a>")
     
     maps_url = a.get("maps_url", "")
     if maps_url:
-        lines.append(f"🗺 [Google Térkép]({maps_url})")
+        lines.append(f"🗺 <a href='{maps_url}'>Google Térkép</a>")
 
-    text = "\n".join(lines)
-    image_bytes = download_image(a.get("image_url")) if a.get("image_url") else None
+    caption = "\n".join(lines)
+    if len(caption) > 1024:
+        caption = caption[:1020] + "…"
+
+    image_url = a.get("image_url")
+    image_bytes = download_image(image_url) if image_url else None
+    sent = False
     
-    try:
-        if image_bytes:
-            await bot.send_photo(chat_id=CHAT_ID, photo=io.BytesIO(image_bytes), caption=text, parse_mode="Markdown")
-        else:
-            await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown", disable_web_page_preview=False)
-        logger.info(f"Telegram elküldve: {a.get('cim')}")
-    except Exception as e:
-        logger.error(f"Telegram küldési hiba: {e}")
+    # Küldési folyamat (Változatlan szinkron logika a te verziódból)
+    if image_bytes:
+        try:
+            bot.send_photo(chat_id=CHAT_ID, photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
+            sent = True
+        except Exception as e:
+            logger.warning(f"Kép küldés (bytes) sikertelen: {e}")
+
+    if not sent and image_url:
+        try:
+            bot.send_photo(chat_id=CHAT_ID, photo=image_url, caption=caption, parse_mode="HTML")
+            sent = True
+        except Exception as e:
+            logger.warning(f"Kép küldés (URL) sikertelen: {e}")
+
+    if not sent:
+        try:
+            bot.send_message(chat_id=CHAT_ID, text=caption, parse_mode="HTML", disable_web_page_preview=False)
+        except Exception as e:
+            logger.error(f"Telegram küldési hiba: {e}")
 
 
-async def send_telegram_messages(auctions: list):
+def send_telegram_messages(auctions: list):
     if not auctions:
+        bot.send_message(
+            chat_id=CHAT_ID,
+            text="📭 Nincs új NAV EAF ingatlan árverési értesítő (minden már ismert).",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
         return
-    for a in auctions:
-        await send_auction_message(a)
+    for idx, a in enumerate(auctions, 1):
+        send_auction_message(idx, a)
 
 
 # =================== Fő logika ===================
@@ -342,6 +376,7 @@ def main():
     
     emails_html = get_emails_since(since)
     if not emails_html:
+        send_telegram_messages([])
         return
 
     all_auctions = []
@@ -354,7 +389,7 @@ def main():
 
     unique = list({a["url"]: a for a in all_auctions}.values())
     
-    # KIZÁRÓLAG AZ INGATLANOK SZŰRÉSE
+    # Kizárólag ingatlan kategóriák szűrése
     real_estate_auctions = [
         a for a in unique 
         if "ingatlan" in a.get("kategoria", "").lower() 
@@ -363,7 +398,7 @@ def main():
     
     new_auctions = filter_new_auctions(real_estate_auctions, seen_urls)
     
-    asyncio.run(send_telegram_messages(new_auctions))
+    send_telegram_messages(new_auctions)
 
     for a in new_auctions:
         seen_urls.add(a["url"])
