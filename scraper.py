@@ -367,14 +367,15 @@ def get_emails_since(since_date):
         mail.login(EMAIL, PASSWORD)
         mail.select("inbox")
 
-        search_criteria = f'(SINCE "{since_date.strftime("%d-%b-%Y")}")'
+        # MÓDOSÍTÁS: Beiktatva az UNSEEN feltétel, így csak az olvasatlan leveleket kéri le
+        search_criteria = f'(UNSEEN SINCE "{since_date.strftime("%d-%b-%Y")}")'
         status, messages = mail.search(None, search_criteria)
         if status != "OK" or not messages[0]:
-            logger.info("Nincs e-mail a megadott időszakban.")
+            logger.info("Nincs új olvasatlan e-mail a megadott időszakban.")
             return []
 
         email_ids = messages[0].split()
-        logger.info(f"Összesen {len(email_ids)} e-mail érkezett {since_date} óta.")
+        logger.info(f"Összesen {len(email_ids)} olvasatlan e-mail érkezett {since_date} óta.")
 
         result = []
         for eid in email_ids:
@@ -546,7 +547,7 @@ async def main():
     # 2. E-mailek lekérése és linkek kinyerése
     emails_html = get_emails_since(since)
     if not emails_html:
-        logger.info("Nem érkezett NAV e-mail az elmúlt 24 órában.")
+        logger.info("Nem érkezett új olvasatlan NAV e-mail az elmúlt 24 órában.")
         await send_telegram_messages([])
         return
 
