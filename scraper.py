@@ -789,7 +789,7 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
         logger.error(f"Nem sikerült kommunikálni a Telegram API-val: {e}")
 
 
-def build_ingatlan_message(a: dict) -> str:
+def build_ingatlan_message(a: dict, include_link: bool = True) -> str:
     """MBVK-stílusú Telegram üzenet ingatlan árverésekhez (Ügyszám nélkül)."""
 
     arveres_nev = escape_html(a.get("kategoria_reszletes") or a.get("kategoria") or "Ingatlan árverés")
@@ -909,15 +909,17 @@ def build_ingatlan_message(a: dict) -> str:
         lines.append("📝 <b>Leírás:</b>")
         lines.append(f"<i>{egyeb_info}</i>")
 
-    lines.append("")
-    lines.append(f"🔗 <a href='{a.get('url', '')}'>Részletek a NAV oldalon</a>")
-    if a.get("maps_url"):
-        lines.append(f"🗺 <a href='{a.get('maps_url')}'>Google Térkép</a>")
+    # Linkek (opcionális)
+    if include_link:
+        lines.append("")
+        lines.append(f"🔗 <a href='{a.get('url', '')}'>Részletek a NAV oldalon</a>")
+        if a.get("maps_url"):
+            lines.append(f"🗺 <a href='{a.get('maps_url')}'>Google Térkép</a>")
 
     return "\n".join(lines)
 
 
-def build_ingosag_message(a: dict) -> str:
+def build_ingosag_message(a: dict, include_link: bool = True) -> str:
     """Ingóság árverési Telegram üzenet (Ügyszám nélkül, darabárral)."""
 
     arveres_nev = escape_html(a.get("kategoria_reszletes") or a.get("kategoria") or "Árverés")
@@ -1015,25 +1017,43 @@ def build_ingosag_message(a: dict) -> str:
     if egyeb_info:
         lines.extend(["", "📝 <b>Leírás:</b>", f"<i>{egyeb_info}</i>"])
 
-    lines.extend(["", f"🔗 <a href='{a.get('url', '')}'>Részletek a NAV oldalon</a>"])
-    if a.get("maps_url"):
-        lines.append(f"🗺 <a href='{a.get('maps_url')}'>Google Térkép</a>")
+    # Linkek (opcionális)
+    if include_link:
+        lines.extend(["", f"🔗 <a href='{a.get('url', '')}'>Részletek a NAV oldalon</a>"])
+        if a.get("maps_url"):
+            lines.append(f"🗺 <a href='{a.get('maps_url')}'>Google Térkép</a>")
 
     return "\n".join(lines)
 
 
-def send_auction_message(a: dict, target_bot_token, target_chat_id, is_real_estate: bool):
-    if is_real_estate:
-        caption = build_ingatlan_message(a)
-    else:
-        caption = build_ingosag_message(a)
-    send_via_requests(caption, a.get("image_url"), target_bot_token, target_chat_id)
+# =================== Tételnév normalizálása a csoportosításhoz ===================
+
+def normalize_item_name(name: str) -> str:
+    """
+    A tétel nevéből egy normalizált kulcsot készít a csoportosításhoz.
+    Kifejezetten a mountain bike és takaróponyva tételeknél összevonja a különböző méreteket.
+    Más tételeknél az eredeti nevet adja vissza (kisbetűsítve).
+    """
+    if not name:
+        return ""
+    lower_name = name.lower().strip()
+    
+    # Mountain bike (26", 24", stb.) összevonása
+    if "mountain" in lower_name and "bike" in lower_name:
+        return "mountainbike"
+    
+    # Takaróponyva (különböző méretek) összevonása
+    if "takaróponyva" in lower_name or "takaro ponyva" in lower_name:
+        return "takaróponyva"
+    
+    # Egyéb tétel: marad az eredeti név (kisbetűsítve)
+    return lower_name
 
 
 # =================== Fő logika ===================
 
 def main():
-    logger.info("=== SCRAPER INDÍTÁSA ===")
+    logger.info("=== SCRAPER V2.2 INDÍTÁSA ===")
     since = datetime.now(timezone.utc) - timedelta(days=1)
     seen_urls = load_seen_urls()
 
@@ -1044,7 +1064,7 @@ def main():
         return
 
     # =====================================================================
-    # 1. NAV EAF feldolgozás – meglévő scraping logika
+    # 1. NAV EAF feldolgozás – scraping + csoportosítás normalizált név szerint
     # =====================================================================
     all_auctions = []
     for html in nav_eaf_htmls:
@@ -1060,13 +1080,14 @@ def main():
     unique_auctions = list({a["url"]: a for a in all_auctions}.values())
     logger.info(f"Összes új NAV EAF feldolgozandó tétel: {len(unique_auctions)}")
 
+    # Szűrés
+    filtered_auctions = []
     for a in unique_auctions:
         kategoria_szoveg = (
             (a.get("kategoria") or "") + " " + (a.get("kategoria_reszletes") or "")
         ).lower()
         is_real_estate = "ingatlan" in kategoria_szoveg
 
-        # ---- SZŰRÉSI LOGIKA ----
         if is_real_estate:
             if CSAK_1_1_TULAJDON:
                 tulajdon = a.get("tulajdoni_hanyad", "")
@@ -1079,27 +1100,61 @@ def main():
                 if becsertek_int > MAX_INGOSAG_BECSERTEK:
                     logger.info(f"-> [SZŰRŐ] Ingóság kihagyva (Becsérték > {MAX_INGOSAG_BECSERTEK} HUF): {a.get('cim')} ({a.get('becsertek')})")
                     continue
-        # ------------------------
+        filtered_auctions.append(a)
+
+    logger.info(f"Szűrés után feldolgozandó tételek: {len(filtered_auctions)}")
+
+    # Csoportosítás normalizált név alapján
+    grouped = {}
+    for a in filtered_auctions:
+        # Alap név: lehetőleg a "cim" mező, de ha nincs, akkor más
+        raw_name = a.get("cim") or a.get("ingatlan_megnevezes") or a.get("tetel_megnevezes") or a.get("kategoria_reszletes") or ""
+        if raw_name:
+            key = normalize_item_name(raw_name)
+        else:
+            key = a["url"]  # ha nincs név, egyedi URL
+        grouped.setdefault(key, []).append(a)
+
+    for group_key, auctions_list in grouped.items():
+        base = auctions_list[0]
+        kategoria_szoveg = (
+            (base.get("kategoria") or "") + " " + (base.get("kategoria_reszletes") or "")
+        ).lower()
+        is_real_estate = "ingatlan" in kategoria_szoveg
 
         if is_real_estate:
             token = REAL_ESTATE_BOT_TOKEN
             chat_id = REAL_ESTATE_CHAT_ID
-            logger.info(f"-> [INGATLAN ROUTING] Küldés az Ingatlan Botnak: {a.get('teljes_cim')}")
+            caption = build_ingatlan_message(base, include_link=False)
         else:
             token = BOT_TOKEN
             chat_id = CHAT_ID
-            logger.info(f"-> [INGÓSÁG ROUTING] Küldés az Ingóság Botnak: {a.get('cim')}")
+            caption = build_ingosag_message(base, include_link=False)
+
+        # Google Térkép link (az első tételé)
+        if base.get("maps_url"):
+            caption += f"\n🗺 <a href='{base.get('maps_url')}'>Google Térkép</a>"
+
+        # Linkek kezelése
+        if len(auctions_list) == 1:
+            # Egyedi tétel: hozzáadjuk a saját linkjét
+            caption += f"\n\n🔗 <a href='{base['url']}'>Részletek a NAV oldalon</a>"
+        else:
+            # Több tétel: felsoroljuk mindet
+            caption += "\n\n📌 <b>Az összes ilyen tétel linkjei:</b>"
+            for idx, a in enumerate(auctions_list, 1):
+                caption += f"\n{idx}. <a href='{a['url']}'>Megtekintés a NAV oldalon</a>"
 
         if token and chat_id:
-            send_auction_message(a, token, chat_id, is_real_estate=is_real_estate)
-            seen_urls.add(a["url"])
+            send_via_requests(caption, base.get("image_url"), token, chat_id)
+            # Az összes URL-t megjelöljük látottként
+            for a in auctions_list:
+                seen_urls.add(a["url"])
         else:
-            logger.error(
-                f"Kihagyva! Hiányzó token vagy chat_id (Ingatlan volt? {is_real_estate})"
-            )
+            logger.error(f"Kihagyva! Hiányzó token vagy chat_id (Ingatlan volt? {is_real_estate})")
 
     # =====================================================================
-    # 2. MNV EAR feldolgozás – közvetlenül a hírlevélből, scraping nélkül
+    # 2. MNV EAR feldolgozás – változatlan
     # =====================================================================
     all_mnv = []
     for html in mnv_ear_htmls:
@@ -1111,12 +1166,10 @@ def main():
         mnv_id = a.get("mnv_id")
         mnv_key = f"mnv_ear_{mnv_id}" if mnv_id else None
 
-        # Duplikát ellenőrzés
         if mnv_key and mnv_key in seen_urls:
             logger.info(f"Már feldolgozott MNV tétel kihagyása: {a.get('tetel_nev_azonosito')}")
             continue
 
-        # Kikiáltási ár szűrés – csak 2 M Ft alattiak
         kikialtas_int = parse_price_to_int(a.get("kikialtas_ar", ""))
         if kikialtas_int == 0:
             logger.warning(f"-> [MNV] Nem sikerült az árat értelmezni: {a.get('tetel_nev_azonosito')}")
@@ -1141,7 +1194,7 @@ def main():
             logger.error("Kihagyva! Hiányzó REAL_ESTATE_BOT_TOKEN vagy REAL_ESTATE_CHAT_ID")
 
     save_seen_urls(seen_urls)
-    logger.info("=== SCRAPER SIKERESEN LEFUTOTT ===")
+    logger.info("=== SCRAPER V2.2 SIKERESEN LEFUTOTT ===")
 
 
 if __name__ == "__main__":
