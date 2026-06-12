@@ -556,7 +556,8 @@ def get_emails_since(since_date):
 
         for idx, eid in enumerate(msg_ids, 1):
             logger.info(f" -> [{idx}/{len(msg_ids)}] E-mail letöltése (ID: {eid.decode()})...")
-            status, msg_data = mail.fetch(eid, "(RFC822)")
+            # BODY.PEEK[]: letölti a levelet anélkül, hogy automatikusan olvasottnak jelölné
+            status, msg_data = mail.fetch(eid, "(BODY.PEEK[])")
             if status != "OK":
                 continue
 
@@ -589,53 +590,99 @@ def get_emails_since(since_date):
 
 # =================== MNV EAR hírlevél feldolgozása (scraping nélkül) ===================
 
-MNV_FIELD_MAP = {
-    "Árverés alkategória neve":                   "alkategoria",
-    "Árverezett tétel megnevezése, azonosítója":  "tetel_nev_azonosito",
-    "Kikiáltási ár":                              "kikialtas_ar",
-    "Meghirdetési dátum és idő":                  "meghirdetes",
-    "Biztosíték megfizetésének határideje":        "biztosítek_hatarido",
-    "Kezdési dátum és idő":                       "kezdet",
-    "Befejezési dátum és idő":                    "befejezes",
-}
+# A felismerni kívánt mezőcímkék és a hozzájuk tartozó dict kulcsok.
+# FONTOS: sorrendben kell tartani – a sor-alapú parser erre támaszkodik.
+MNV_LABEL_FIELD = [
+    ("Árverés alkategória neve",                    "alkategoria"),
+    ("Árverezett tétel megnevezése, azonosítója",   "tetel_nev_azonosito"),
+    ("Kikiáltási ár",                               "kikialtas_ar"),
+    ("Meghirdetési dátum és idő",                   "meghirdetes"),
+    ("Biztosíték megfizetésének határideje",         "biztosítek_hatarido"),
+    ("Kezdési dátum és idő",                        "kezdet"),
+    ("Befejezési dátum és idő",                     "befejezes"),
+]
+
+
+def _finalize_mnv_auction(auction_data: dict) -> dict | None:
+    """Egyedi azonosítót és rövid cím-verziót told bele a dict-be; None-t ad vissza ha hiányos."""
+    if "tetel_nev_azonosito" not in auction_data or "kikialtas_ar" not in auction_data:
+        return None
+    raw_nev = auction_data.get("tetel_nev_azonosito", "")
+    id_match = re.search(r'\[(\d+/\d+)\]', raw_nev)
+    auction_data["mnv_id"] = id_match.group(1) if id_match else None
+    cim_match = re.match(r'^(.*?)(?:\s*[\[\(])', raw_nev)
+    auction_data["cim_rovid"] = cim_match.group(1).strip() if cim_match else raw_nev
+    return auction_data
 
 
 def parse_mnv_ear_auctions(html_content: str) -> list:
     """
-    Az MNV EAR hírlevél HTML-jéből közvetlenül kinyeri az árverési tételeket,
-    scraping nélkül. Minden táblázatot megvizsgál; ha tartalmaz árverési mezőket,
-    dict-ként hozzáadja a listához.
+    Kinyeri az MNV EAR hírlevél árverési tételeit HTML-tartalmából.
+
+    A HTML-t BeautifulSoup-pal szöveggé alakítja, majd soronként dolgozza fel.
+    Ez az eljárás forwarded Gmail-leveleknél is megbízhatóan működik,
+    hiszen nem függ a HTML táblázat-struktúrájától.
+
+    Logika:
+      - Minden „Árverés alkategória neve" sort új árverési blokk kezdetének tekint.
+      - Az egyes mezők értéke lehet ugyanazon a soron (pl. „Kikiáltási ár  64 770 000 Ft")
+        VAGY a következő nem-üres, nem-mezőcímke soron.
+      - Egy blokk lezárul, ha újabb „Árverés alkategória neve" sort talál.
     """
     soup = BeautifulSoup(html_content, "html.parser")
+    raw_text = soup.get_text(separator="\n")
+    lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
+
+    all_labels = {label for label, _ in MNV_LABEL_FIELD}
+
+    def is_label(line: str) -> bool:
+        return any(lbl in line for lbl in all_labels)
+
+    def next_value(lines: list, idx: int) -> str:
+        """A következő nem-üres, nem-mezőcímke sort adja vissza értékként."""
+        j = idx + 1
+        while j < len(lines):
+            if lines[j] and not is_label(lines[j]):
+                return lines[j]
+            break
+        return ""
+
     auctions = []
+    current: dict = {}
+    i = 0
 
-    for table in soup.find_all("table"):
-        auction_data = {}
-        for row in table.find_all("tr"):
-            cells = row.find_all("td")
-            if len(cells) < 2:
+    while i < len(lines):
+        line = lines[i]
+
+        for label, field in MNV_LABEL_FIELD:
+            if label not in line:
                 continue
-            key = clean_text(cells[0].get_text())
-            value = clean_text(cells[1].get_text())
-            if not key or not value:
-                continue
-            for field_key, dict_key in MNV_FIELD_MAP.items():
-                if field_key in key:
-                    auction_data[dict_key] = value
-                    break
 
-        # Csak akkor vesszük fel, ha van legalább tétel és ár
-        if "tetel_nev_azonosito" in auction_data and "kikialtas_ar" in auction_data:
-            # Egyedi azonosító kinyerése: pl. [49881/260608]
-            id_match = re.search(r'\[(\d+/\d+)\]', auction_data.get("tetel_nev_azonosito", ""))
-            auction_data["mnv_id"] = id_match.group(1) if id_match else None
+            # Új blokk indul – az előző mentése ha kész
+            if field == "alkategoria" and current:
+                result = _finalize_mnv_auction(current)
+                if result:
+                    auctions.append(result)
+                current = {}
 
-            # Cím kinyerése a tétel nevéből (szögletes és kerek zárójelek előtti rész)
-            raw_nev = auction_data.get("tetel_nev_azonosito", "")
-            cim_match = re.match(r'^(.*?)(?:\s*[\[\(])', raw_nev)
-            auction_data["cim_rovid"] = cim_match.group(1).strip() if cim_match else raw_nev
+            # Érték kinyerése: ugyanazon a soron a label után, vagy a következő soron
+            after_label = line[line.index(label) + len(label):].strip().lstrip(":").strip()
+            if after_label:
+                current[field] = after_label
+            else:
+                val = next_value(lines, i)
+                if val:
+                    current[field] = val
+                    i += 1  # következő sort már feldolgoztuk
+            break
 
-            auctions.append(auction_data)
+        i += 1
+
+    # Utolsó blokk mentése
+    if current:
+        result = _finalize_mnv_auction(current)
+        if result:
+            auctions.append(result)
 
     logger.info(f"MNV EAR: {len(auctions)} tétel kinyerve az e-mailből.")
     return auctions
