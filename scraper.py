@@ -193,6 +193,11 @@ def parse_nav_eaf_details(url):
                         elif "Egyszerre árverezett tétel darabszám" in key: data["darabszam"] = value
                         elif "Állapot" in key: data["allapot"] = value
                         elif "Egyéb infó" in key: data["egyeb_info"] = value
+                        elif "Cím irányítószám, város" in key: data["Cím irányítószám, város"] = value
+                        elif "Cím utca" in key: data["Cím utca"] = value
+                        elif "Házszám, emelet, ajtó" in key: data["Házszám, emelet, ajtó"] = value
+                        elif "Az árverezett tétel megtekinthető, idő" in key: data["megtekintes_ido"] = value
+   
 
     data["image_url"] = scrape_main_image(url, soup)
 
@@ -310,42 +315,65 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
 
 
 def send_auction_message(a: dict, target_bot_token, target_chat_id, is_real_estate: bool):
-    # 1. Először levágjuk a nyers, hosszú szövegeket, hogy véletlenül se sérüljön a HTML struktúra
+    # 1. Nyers leírások levágása a biztonságos HTML kezelés érdekében
     leiras_nyers = a.get("egyeb_info", "")
     if len(leiras_nyers) > 400:
         leiras_nyers = leiras_nyers[:400] + "…"
 
-    # 2. Csak most futtatjuk le az escape_html-t a tiszta adatokra
-    cim = escape_html(a.get('cim', 'N/A'))
-    megye = escape_html(a.get("megye", ""))
-    tavolsag = escape_html(a.get("tavolsag", ""))
-    allapot = escape_html(a.get('allapot', 'N/A'))
-    darabszam = escape_html(a.get('darabszam', ''))
-    becsertek = escape_html(a.get('becsertek', 'N/A'))
-    minimal_ajanlat = escape_html(a.get('minimal_ajanlat', 'N/A'))
+    # Biztonsági HTML escape a változókra
+    leiras = escape_html(leiras_nyers)
+    becsertek = escape_html(a.get('becsertek', '0 HUF'))
+    minimal_ajanlat = escape_html(a.get('minimal_ajanlat', '0 HUF'))
     kezdet = escape_html(a.get('kezdet', 'N/A'))
     befejezes = escape_html(a.get('befejezes', 'N/A'))
-    ugyszam = escape_html(a.get('ugyintezesi_szam', ''))
-    leiras = escape_html(leiras_nyers)
+    darabszam = escape_html(a.get('darabszam', ''))
 
-    # 3. Összeállítjuk a fix, biztonságos HTML üzenetet
-    fejlec = "🆕 <b>NAV INGATLAN TALÁLAT</b>" if is_real_estate else "🆕 <b>NAV INGÓSÁG TALÁLAT</b>"
+    # 2. Cím és elhelyezkedés precíz felépítése a PDF struktúra alapján
+    varos_resz = a.get('Cím irányítószám, város', a.get('város', '')).strip()
+    utca_resz = a.get('Cím utca', a.get('utca', '')).strip()
+    hazszam_resz = a.get('Házszám, emelet, ajtó', a.get('házszám', '')).strip()
+    
+    teljes_cim = f"{varos_resz}, {utca_resz} {hazszam_resz}".strip(", ").replace("  ", " ")
+    if not teljes_cim or teljes_cim == ",":
+        teljes_cim = a.get('cim', 'Ismeretlen helyszín')
+
+    megye = escape_html(a.get("megye", ""))
+    tavolsag = a.get("tavolsag", "")
+    
+    # Ha a megtekintés helye "ingatlan címén", cseréljük le a szép, teljes címre
+    helyszin_szoveg = a.get("megtekintes_hely", "")
+    if not helyszin_szoveg or "ingatlan címén" in helyszin_szoveg.lower():
+        helyszin_szoveg = teljes_cim
+    helyszin_szoveg = escape_html(helyszin_szoveg)
+
+    # 3. Állapot / Kategória kezelése (N/A szűrése)
+    allapot_nyers = a.get('allapot', '').strip()
+    if not allapot_nyers or allapot_nyers.upper() == "N/A":
+        allapot_nyers = a.get('kategoria_reszletes', a.get('kategoria', 'Egyéb tétel'))
+    allapot = escape_html(allapot_nyers)
+
+    # 4. Üzenet felépítése a screenshot stílusában (Ügyszám nélkül)
+    fejlec = "🔔 <b>NAV INGATLAN TALÁLAT – ÚJ LICIT</b>" if is_real_estate else "🔔 <b>NAV INGÓSÁG TALÁLAT – ÚJ LICIT</b>"
     
     lines = [
         fejlec, "",
         "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
-        f"📍 <b>Megnevezés/Cím:</b> {cim}"
+        f"📍 <b>Cím:</b> {teljes_cim}"
     ]
     
-    if megye: lines.append(f"🏛 <b>Megye:</b> {megye}")
-    if tavolsag and tavolsag != "N/A": lines.append(f"🗺 <b>Budapest-távolság:</b> {tavolsag}")
+    if megye: 
+        lines.append(f"🏛 <b>Megye:</b> {megye}")
+        
+    if tavolsag and "Nem sikerült" not in tavolsag and tavolsag != "N/A": 
+        lines.append(f"🗺 <b>Budapest-távolság:</b> {tavolsag}")
     
     lines.extend([
         "",
-        "🏠 <b>2. Jellemzők</b>",
-        f"🚪 <b>Állapot / Leírás:</b> {allapot}"
+        "🏠 <b>2. Az Ingatlan és a Telek Jellemzői</b>" if is_real_estate else "📦 <b>2. A Tétel Jellemzői</b>",
+        f"🚪 <b>Kategória / Állapot:</b> {allapot}"
     ])
-    if darabszam: lines.append(f"🔢 <b>Darabszám:</b> {darabszam}")
+    if darabszam: 
+        lines.append(f"🔢 <b>Darabszám:</b> {darabszam}")
     
     lines.extend([
         "",
@@ -353,19 +381,25 @@ def send_auction_message(a: dict, target_bot_token, target_chat_id, is_real_esta
         f"💵 <b>Becsérték (Jelenlegi ár):</b> {becsertek}",
         f"📉 <b>Minimál ajánlat:</b> {minimal_ajanlat}",
         "",
-        "⚖️ <b>4. Jogi és Árverési Státusz</b>",
-        f"▶️ <b>Árverés kezdete:</b> {kezdet}",
-        f"📅 <b>Árverés vége:</b> {befejezes}"
+        "📅 <b>4. Időpontok és Árverési Státusz</b>",
+        f"▶️ <b>Kezdés:</b> {kezdet}",
+        f"⬜ <b>Befejezés:</b> {befejezes}"
     ])
-    if ugyszam: lines.append(f"📄 <b>Ügyszám:</b> {ugyszam}")
+    
+    # Megtekintési infók integrálása a 4-es blokk alá, ahogy a mintán szerepel
+    if a.get("megtekintes_hely"):
+        lines.append(f"📍 <b>Helyszín:</b> {helyszin_szoveg}")
+    if a.get("megtekintes_ido"):
+        lines.append(f"🕒 <b>Időpont:</b> {escape_html(a.get('megtekintes_ido'))}")
     
     if leiras:
-        lines.extend(["", f"📝 <b>Részletes leírás:</b>", f"<i>{leiras}</i>"])
+        lines.extend(["", f"📝 <b>Leírás:</b>", f"<i>{leiras}</i>"])
         
     lines.extend(["", f"🔗 <a href='{a.get('url', '')}'>Részletek a NAV oldalon</a>"])
     
     maps_url = a.get("maps_url", "")
-    if maps_url: lines.append(f"🗺 <a href='{maps_url}'>Google Térkép</a>")
+    if maps_url: 
+        lines.append(f"🗺 <a href='{maps_url}'>Google Térkép</a>")
 
     caption = "\n".join(lines)
     send_via_requests(caption, a.get("image_url"), target_bot_token, target_chat_id)
