@@ -68,7 +68,24 @@ def clean_text(text):
 def escape_html(text):
     if not text:
         return ""
-    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return str(text).replace("&", "&").replace("<", "<").replace(">", ">")
+
+
+def remove_sablon_szoveg(text):
+    """Eltávolítja a NAV-os sablonszövegeket a leírásból."""
+    if not text:
+        return ""
+    
+    sablonok = [
+        "Az elárverezett vagyontárgyakért sem az adós, sem az adóhatóság jótállással nem tartozik. A megtekintés során a résztvevők által nem észlelt vagy fel nem ismerhető rejtett hibákért, a vagyontárgy esetlegesen előforduló vélt vagy valós hiányosságaiért az adóhatóság felelősséget nem vállal.",
+        "Az elárverezett vagyontárgyakért sem az adós, sem az adóhatóság jótállással nem tartozik.",
+        "A megtekintés során a résztvevők által nem észlelt vagy fel nem ismerhető rejtett hibákért, a vagyontárgy esetlegesen előforduló vélt vagy valós hiányosságaiért az adóhatóság felelősséget nem vállal."
+    ]
+    
+    for s in sablonok:
+        text = text.replace(s, "")
+        
+    return " ".join(text.split()).strip()
 
 
 def extract_nav_eaf_links(html_content):
@@ -150,12 +167,10 @@ def scrape_main_image(soup):
     """Első kép az oldalról (fullurl attribútum vagy képgaléria)."""
     BASE = "https://arveres.nav.gov.hu"
     try:
-        # Elsőként fullurl attribútumú képek
         for img_tag in soup.find_all("img"):
             fullurl = img_tag.get("fullurl", "").strip()
             if fullurl:
                 return fullurl if fullurl.startswith("http") else BASE + "/" + fullurl.lstrip("/")
-        # Fallback: képgaléria bármely img src
         galeria = soup.find("div", string=re.compile("Képgaléria", re.IGNORECASE))
         if galeria:
             parent = galeria.find_parent()
@@ -171,8 +186,6 @@ def scrape_main_image(soup):
 
 # =================== NAV oldal feldolgozása ===================
 
-# Mezők, amelyeket az "Árverés alapadatok" és "Árverezett tétel adatok" táblákból kiolvasunk.
-# Kulcs: a táblában szereplő szöveg (részben), Érték: data dict kulcsa
 FIELD_MAP = {
     "Árverés megnevezése":                      "kategoria",
     "Végrehajtási ügyszám":                     "ugyintezesi_szam",
@@ -227,7 +240,6 @@ def parse_nav_eaf_details(url):
     soup = BeautifulSoup(html_text, "html.parser")
     data = {"url": url}
 
-    # --- Megye kinyerése a szövegből (fallback) ---
     megye_match = re.search(
         r'([A-ZÁÉÍÓÖŐÚÜŰ][a-záéíóöőúüűA-ZÁÉÍÓÖŐÚÜŰ\-]+)\s+(?:Vár)?megye',
         html_text
@@ -235,7 +247,6 @@ def parse_nav_eaf_details(url):
     if megye_match:
         data["megye"] = megye_match.group(1).strip() + " vármegye"
 
-    # --- Fő táblák feldolgozása ---
     for div in soup.find_all("div", class_="FrissPortlet"):
         header = div.find("div", class_="HeaderTitle")
         if not header:
@@ -251,7 +262,6 @@ def parse_nav_eaf_details(url):
 
         table = div.find("table", class_="DownloadAppsList")
         if not table:
-            # Fallback: bármely tábla a divben
             table = div.find("table")
         if not table:
             continue
@@ -272,24 +282,19 @@ def parse_nav_eaf_details(url):
                     matched = True
                     break
 
-            # Speciális eset: "Bejegyzések a tulajdoni lapon" – hosszabb szöveg
             if not matched and "Bejegyzések a tulajdoni lapon" in key:
                 data["tulajdoni_lap_bejegyzesek"] = value
 
             if not matched and "Egyéb megjegyzések" in key:
                 data["egyeb_megjegyzesek"] = value
 
-    # --- Megye egységesítése (táblából vagy regex-ből) ---
     if "megye_tabla" in data and data["megye_tabla"]:
         raw = data["megye_tabla"]
-        # NAV-on néha csak a vármegye neve szerepel „Szolnok" formában
         if "vármegye" not in raw.lower() and "megye" not in raw.lower():
             data["megye"] = raw + " vármegye"
         else:
             data["megye"] = raw
-    # Ha a regex talált valamit és a tábla nem, hagyjuk a regex eredményt
 
-    # --- Teljes cím összeállítása ---
     varos = data.get("varos", "").strip()
     utca = data.get("utca", "").strip()
     hazszam = data.get("hazszam", "").strip()
@@ -302,13 +307,10 @@ def parse_nav_eaf_details(url):
     else:
         data["teljes_cim"] = data.get("megtekintes_hely", "")
 
-    # --- Kép ---
     data["image_url"] = scrape_main_image(soup)
 
-    # --- Geocódolás és távolság (ingatlanoknál a tényleges cím alapján) ---
     geocode_input = data.get("teljes_cim") or data.get("megtekintes_hely", "")
 
-    # ingatlanoknál NE szűrjük ki az "ingatlan címén" értéket – ilyenkor a teljes_cim-et használjuk
     if geocode_input and geocode_input.lower() not in ("ingatlan címén", ""):
         coords = geocode_address(geocode_input)
         if coords:
@@ -322,7 +324,6 @@ def parse_nav_eaf_details(url):
         else:
             data["tavolsag"] = "N/A"
     else:
-        # "ingatlan címén" esetén a teljes_cim alapján próbálunk geocódolni
         if data.get("teljes_cim"):
             coords = geocode_address(data["teljes_cim"])
             if coords:
@@ -338,7 +339,6 @@ def parse_nav_eaf_details(url):
         else:
             data["tavolsag"] = "N/A"
 
-    # --- Megjelenítési cím / tétel neve ---
     data["cim"] = (
         data.get("ingatlan_megnevezes")
         or data.get("tetel_megnevezes")
@@ -458,7 +458,7 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
 
 
 def build_ingatlan_message(a: dict) -> str:
-    """MBVK-stílusú Telegram üzenet ingatlan árverésekhez."""
+    """MBVK-stílusú Telegram üzenet ingatlan árverésekhez (Ügyszám nélkül)."""
 
     arveres_nev = escape_html(a.get("kategoria_reszletes") or a.get("kategoria") or "Ingatlan árverés")
     ingatlan_nev = escape_html(a.get("ingatlan_megnevezes") or a.get("cim") or "Ismeretlen")
@@ -473,7 +473,6 @@ def build_ingatlan_message(a: dict) -> str:
     kezdet = escape_html(a.get("kezdet") or "N/A")
     befejezes = escape_html(a.get("befejezes") or "N/A")
     megtekintes_ido = escape_html(a.get("megtekintes_ido") or "")
-    ugyintezesi_szam = escape_html(a.get("ugyintezesi_szam") or "")
 
     tulajdoni_hanyad = escape_html(a.get("tulajdoni_hanyad") or "")
     helyrajzi_szam = escape_html(a.get("helyrajzi_szam") or "")
@@ -486,7 +485,10 @@ def build_ingatlan_message(a: dict) -> str:
     novenyzet = escape_html(a.get("novenyzet") or "")
 
     bejegyzesek = escape_html(a.get("tulajdoni_lap_bejegyzesek") or "")
+    
+    # Sablonszöveg szűrése
     egyeb_info = a.get("egyeb_info") or a.get("egyeb_megjegyzesek") or ""
+    egyeb_info = remove_sablon_szoveg(egyeb_info)
     if len(egyeb_info) > 500:
         egyeb_info = egyeb_info[:500] + "…"
     egyeb_info = escape_html(egyeb_info)
@@ -533,15 +535,12 @@ def build_ingatlan_message(a: dict) -> str:
     lines.append(f"💵 <b>Becsérték:</b> {becsertek}")
     lines.append(f"📉 <b>Minimál ajánlat:</b> {minimal_ajanlat}")
     if arveres_eloleg:
-        # Az előleg szövege hosszú lehet, csak az összeget emeljük ki
         eloleg_match = re.search(r"(\d[\d\s]*(?:HUF|Ft))", a.get("arveres_eloleg", ""))
         if eloleg_match:
             lines.append(f"💳 <b>Árverési előleg:</b> {escape_html(eloleg_match.group(1))}")
 
     lines.append("")
     lines.append("⚖️ <b>4. Jogi és Árverési Státusz</b>")
-    if ugyintezesi_szam:
-        lines.append(f"📁 <b>Ügyszám:</b> {ugyintezesi_szam}")
     lines.append(f"▶️ <b>Árverés kezdete:</b> {kezdet}")
     lines.append(f"🏁 <b>Árverés vége:</b> {befejezes}")
     if megtekintes_ido:
@@ -566,7 +565,7 @@ def build_ingatlan_message(a: dict) -> str:
 
 
 def build_ingosag_message(a: dict) -> str:
-    """Ingóság árverési Telegram üzenet."""
+    """Ingóság árverési Telegram üzenet (Ügyszám nélkül)."""
 
     arveres_nev = escape_html(a.get("kategoria_reszletes") or a.get("kategoria") or "Árverés")
     tetel_nev = escape_html(a.get("cim") or "Ismeretlen tétel")
@@ -578,17 +577,15 @@ def build_ingosag_message(a: dict) -> str:
     darabszam = escape_html(a.get("darabszam") or "")
     megye = escape_html(a.get("megye") or "")
     tavolsag = a.get("tavolsag", "")
-    ugyintezesi_szam = escape_html(a.get("ugyintezesi_szam") or "")
     megtekintes_ido = escape_html(a.get("megtekintes_ido") or "")
 
-    varos = a.get("varos", "").strip()
-    utca = a.get("utca", "").strip()
-    hazszam = a.get("hazszam", "").strip()
     teljes_cim = escape_html(
         a.get("teljes_cim") or a.get("megtekintes_hely") or "Ismeretlen helyszín"
     )
 
+    # Sablonszöveg szűrése
     egyeb_info = a.get("egyeb_info") or ""
+    egyeb_info = remove_sablon_szoveg(egyeb_info)
     if len(egyeb_info) > 400:
         egyeb_info = egyeb_info[:400] + "…"
     egyeb_info = escape_html(egyeb_info)
@@ -622,8 +619,6 @@ def build_ingosag_message(a: dict) -> str:
         "",
         "📅 <b>4. Időpontok és Árverési Státusz</b>",
     ])
-    if ugyintezesi_szam:
-        lines.append(f"📁 <b>Ügyszám:</b> {ugyintezesi_szam}")
     lines.append(f"▶️ <b>Kezdés:</b> {kezdet}")
     lines.append(f"🏁 <b>Befejezés:</b> {befejezes}")
     if megtekintes_ido:
