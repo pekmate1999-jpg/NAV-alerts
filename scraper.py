@@ -11,14 +11,20 @@ import io
 import re
 import socket
 
-# Globális időtúllépés beállítása (45 másodperc), hogy a kód SOHA ne tudjon végtelenül lógni a hálózaton
+# Globális időtúllépés beállítása (45 másodperc)
 socket.setdefaulttimeout(45)
 
 # ------------------- Konfiguráció -------------------
 EMAIL = os.environ.get("EMAIL_ADDRESS")
 PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
+
+# Alap bot az INGÓSÁGOKNAK
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
+
+# Új bot az INGATLANOKNAK
+REAL_ESTATE_BOT_TOKEN = os.environ.get("REAL_ESTATE_BOT_TOKEN")
+REAL_ESTATE_CHAT_ID = os.environ.get("REAL_ESTATE_CHAT_ID")
 
 # Budapest XVII. ker. Sáránd utca koordinátái a távolságszámításhoz
 ORIGIN_LAT = 47.4344
@@ -189,6 +195,7 @@ def parse_nav_eaf_details(url):
 
     data["image_url"] = scrape_main_image(url, soup)
 
+    # Csak akkor geokódolunk és számolunk távolságot, ha van megtekintési hely megadva
     megtekintes_hely = data.get("megtekintes_hely", "")
     if megtekintes_hely:
         coords = geocode_address(megtekintes_hely)
@@ -202,7 +209,7 @@ def parse_nav_eaf_details(url):
     else:
         data["tavolsag"] = "N/A"
 
-    data["cim"] = data.get("tetel_megnevezes") or data.get("kategoria_reszletes") or "Ismeretlen ingatlan"
+    data["cim"] = data.get("tetel_megnevezes") or data.get("kategoria_reszletes") or "Ismeretlen tétel"
     return data
 
 
@@ -228,7 +235,6 @@ def get_emails_since(since_date):
         mail.login(EMAIL, PASSWORD)
         mail.select("inbox")
 
-        # SZŰRÉS: Kizárólag az OLVASATLAN (UNSEEN) levelek lekérése, amik a megadott dátum óta érkeztek
         search_criteria = f'(UNSEEN SINCE "{since_date.strftime("%d-%b-%Y")}")'
         logger.info(f"Keresési feltétel küldése: {search_criteria}")
         status, messages = mail.search(None, search_criteria)
@@ -258,7 +264,6 @@ def get_emails_since(since_date):
                 if html_body:
                     result.append(html_body)
             
-            # A levél olvasottnak jelölése, hogy legközelebb ne nézze meg újra
             mail.store(eid, "+FLAGS", "\\Seen")
         
         mail.close()
@@ -269,16 +274,22 @@ def get_emails_since(since_date):
         return []
 
 
-# =================== Üzenetküldés tiszta HTTP-vel ===================
+# =================== Üzenetküldés Dinamikus Bot Választással ===================
 
-def send_via_requests(caption, image_url=None):
+def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
+    """Közvetlen API hívás a dinamikusan átadott bot credentials-ökkel."""
+    if not target_bot_token or not target_chat_id:
+        logger.error("Hiba: Hiányzó Telegram token vagy chat ID!")
+        return
+
+    # 1. Kép letöltése és küldése bájtként
     if image_url:
         try:
             img_resp = requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             if img_resp.status_code == 200 and "image" in img_resp.headers.get("Content-Type", ""):
-                url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+                url = f"https://api.telegram.org/bot{target_bot_token}/sendPhoto"
                 files = {'photo': ('image.jpg', img_resp.content, 'image/jpeg')}
-                data = {'chat_id': CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}
+                data = {'chat_id': target_chat_id, 'caption': caption, 'parse_mode': 'HTML'}
                 
                 resp = requests.post(url, files=files, data=data, timeout=20)
                 if resp.status_code == 200:
@@ -286,11 +297,12 @@ def send_via_requests(caption, image_url=None):
                     return
                 logger.warning(f"Képküldés API hiba: {resp.text}")
         except Exception as e:
-            logger.warning(f"Nem sikerült a képet letölteni/küldeni, megpróbáljuk sima szövegként: {e}")
+            logger.warning(f"Nem sikerült a képet küldeni, megpróbáljuk sima szövegként: {e}")
 
+    # 2. Sima szöveges küldés (pót-megoldásként vagy ha nincs kép)
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        data = {'chat_id': CHAT_ID, 'text': caption, 'parse_mode': 'HTML', 'disable_web_page_preview': False}
+        url = f"https://api.telegram.org/bot{target_bot_token}/sendMessage"
+        data = {'chat_id': target_chat_id, 'text': caption, 'parse_mode': 'HTML', 'disable_web_page_preview': False}
         resp = requests.post(url, data=data, timeout=20)
         if resp.status_code == 200:
             logger.info("Sikeresen kiküldve sima szövegként.")
@@ -300,11 +312,15 @@ def send_via_requests(caption, image_url=None):
         logger.error(f"Nem sikerült kommunikálni a Telegram API-val: {e}")
 
 
-def send_auction_message(a: dict):
-    lines = ["🆕 <b>NAV INGATLAN TALÁLAT</b>", ""]
+def send_auction_message(a: dict, target_bot_token, target_chat_id, is_real_estate: bool):
+    # Fejléc beállítása kategóriától függően
+    if is_real_estate:
+        lines = ["🆕 <b>NAV INGATLAN TALÁLAT</b>", ""]
+    else:
+        lines = ["🆕 <b>NAV INGÓSÁG TALÁLAT</b>", ""]
     
     lines.append("🌍 <b>1. Elhelyezkedés és Alapadatok</b>")
-    lines.append(f"📍 <b>Cím:</b> {escape_html(a.get('cim', 'N/A'))}")
+    lines.append(f"📍 <b>Megnevezés/Cím:</b> {escape_html(a.get('cim', 'N/A'))}")
     
     megye_str = escape_html(a.get("megye", ""))
     if megye_str: lines.append(f"🏛 <b>Megye:</b> {megye_str}")
@@ -313,8 +329,8 @@ def send_auction_message(a: dict):
     if dist_str and dist_str != "N/A": lines.append(f"🗺 <b>Budapest-távolság:</b> {dist_str}")
     lines.append("")
     
-    lines.append("🏠 <b>2. Az Ingatlan és a Telek Jellemzői</b>")
-    lines.append(f"🚪 <b>Állapot / Beköltözhetőség:</b> {escape_html(a.get('allapot', 'N/A'))}")
+    lines.append("🏠 <b>2. Jellemzők</b>")
+    lines.append(f"🚪 <b>Állapot / Leírás:</b> {escape_html(a.get('allapot', 'N/A'))}")
     if a.get("darabszam"): lines.append(f"🔢 <b>Darabszám:</b> {escape_html(a['darabszam'])}")
     lines.append("")
     
@@ -331,7 +347,7 @@ def send_auction_message(a: dict):
     
     leiras = a.get("egyeb_info", "")
     if leiras:
-        lines.append(f"📝 <b>Leírás:</b>\n<i>{escape_html(leiras[:400])}</i>")
+        lines.append(f"📝 <b>Részletes leírás:</b>\n<i>{escape_html(leiras[:400])}</i>")
         lines.append("")
         
     lines.append(f"🔗 <a href='{a.get('url', '')}'>Részletek a NAV oldalon</a>")
@@ -343,7 +359,7 @@ def send_auction_message(a: dict):
     if len(caption) > 1024:
         caption = caption[:1020] + "…"
 
-    send_via_requests(caption, a.get("image_url"))
+    send_via_requests(caption, a.get("image_url"), target_bot_token, target_chat_id)
 
 
 # =================== Fő logika ===================
@@ -369,19 +385,30 @@ def main():
             else:
                 logger.info(f"Már feldolgozott link kihagyása: {link}")
 
-    unique = list({a["url"]: a for a in all_auctions}.values())
+    # Futáson belüli egyediesítés URL alapján
+    unique_auctions = list({a["url"]: a for a in all_auctions}.values())
+    logger.info(f"Összes új feldolgozandó tétel száma: {len(unique_auctions)}")
     
-    real_estate_auctions = [
-        a for a in unique 
-        if "ingatlan" in a.get("kategoria", "").lower() 
-        or "ingatlan" in a.get("kategoria_reszletes", "").lower()
-    ]
-    
-    logger.info(f"Új beküldendő ingatlanok száma: {len(real_estate_auctions)}")
-    
-    for a in real_estate_auctions:
-        send_auction_message(a)
-        seen_urls.add(a["url"])
+    for a in unique_auctions:
+        # Intelligens kategória felismerés (ingatlan vs ingóság)
+        kategoria_szoveg = (a.get("kategoria", "") + " " + a.get("kategoria_reszletes", "")).lower()
+        is_real_estate = "ingatlan" in kategoria_szoveg
+        
+        if is_real_estate:
+            token = REAL_ESTATE_BOT_TOKEN
+            chat_id = REAL_ESTATE_CHAT_ID
+            logger.info(f"-> [INGATLAN ROUTING] Küldés az Ingatlan Botnak: {a.get('cim')}")
+        else:
+            token = BOT_TOKEN
+            chat_id = CHAT_ID
+            logger.info(f"-> [INGÓSÁG ROUTING] Küldés az Ingóság Botnak: {a.get('cim')}")
+            
+        # Küldés végrehajtása
+        if token and chat_id:
+            send_auction_message(a, token, chat_id, is_real_estate=is_real_estate)
+            seen_urls.add(a["url"])
+        else:
+            logger.error(f"Kihagyva! Hiányzó token vagy chat_id ehhez a típushoz (Ingatlan volt? {is_real_estate})")
         
     save_seen_urls(seen_urls)
     logger.info("=== SCRAPER SIKERESEN LEFUTOTT ===")
