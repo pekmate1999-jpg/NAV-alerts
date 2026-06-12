@@ -10,16 +10,17 @@ from datetime import datetime, timezone, timedelta
 import logging
 import io
 import asyncio
+import re
 
-# ------------------- Konfiguráció (ÚJ SECRETS) -------------------
+# ------------------- Konfiguráció (REALESTATE SECRETS) -------------------
 EMAIL = os.environ.get("EMAIL_ADDRESS")
 PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
 
-# Áthangolva a Real Estate (MBVK) botra és csatornára
+# MBVK / Realestate bot hozzáférések
 BOT_TOKEN = os.environ.get("REALESTATE_BOT_TOKEN")
 CHAT_ID = os.environ.get("REALESTATE_CHAT_ID")
 
-# Budapest XVII. ker. Sáránd utca közelítő koordinátái (kiindulópont a távolsághoz)
+# Budapest XVII. ker. Sáránd utca koordinátái a távolságszámításhoz
 ORIGIN_LAT = 47.4344
 ORIGIN_LON = 19.2198
 
@@ -56,10 +57,19 @@ def filter_new_auctions(auctions: list, seen: set) -> list:
     return [a for a in auctions if a.get("url") and a["url"] not in seen]
 
 
-# =================== Segédfüggvények ===================
+# =================== Segédfüggvények & Térkép ===================
 
 def clean_text(text):
     return " ".join(text.split()) if text else ""
+
+
+def escape_markdown(text):
+    """Biztonságossá teszi a szöveget a Telegram Markdown V1 parse_mode számára"""
+    if not text:
+        return ""
+    for ch in ["*", "_", "`", "["]:
+        text = text.replace(ch, f"\\{ch}")
+    return text
 
 
 def extract_nav_eaf_links(html_content):
@@ -76,7 +86,6 @@ def extract_nav_eaf_links(html_content):
 
 
 def simplify_address(address):
-    import re
     candidates = [address]
     cleaned = re.sub(r",?\s*\d+(/\d+)?\s*hrsz\.?", "", address, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(külterület|belterület|tanya)\b", "", cleaned, flags=re.IGNORECASE)
@@ -89,7 +98,7 @@ def simplify_address(address):
         city_only = city_match.group(1).strip()
         if city_only not in candidates:
             candidates.append(city_only)
-    return seen
+    return candidates
 
 
 def geocode_address(address):
@@ -109,13 +118,9 @@ def geocode_address(address):
     return None
 
 
-def get_drive_distance(dest_address):
-    coords = geocode_address(dest_address)
-    if not coords:
-        return None
-    dest_lat, dest_lon = coords
+def get_drive_distance(dest_lat, dest_lon):
     try:
-        url = f"http://router.project-osrm.org/route/v1/driving/{dest_lon},{dest_lat};{ORIGIN_LON},{ORIGIN_LAT}?overview=false"
+        url = f"http://router.project-osrm.org/route/v1/driving/{ORIGIN_LON},{ORIGIN_LAT};{dest_lon},{dest_lat}?overview=false"
         resp = requests.get(url, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
@@ -160,6 +165,11 @@ def parse_nav_eaf_details(url):
     soup = BeautifulSoup(html_text, "html.parser")
     data = {"url": url}
 
+    # Intelligens megye-felismerés a forráskódból
+    megye_match = re.search(r'([A-ZÁÉÍÓÖŐÚÜŰ][a-záéíóöőúüűA-ZÁÉÍÓÖŐÚÜŰ\-]+)\s+(?:Vár)?megye', html_text)
+    if megye_match:
+        data["megye"] = megye_match.group(1).strip() + " vármegye"
+
     # Táblázatok feldolgozása
     for div in soup.find_all("div", class_="FrissPortlet"):
         header = div.find("div", class_="HeaderTitle")
@@ -188,10 +198,17 @@ def parse_nav_eaf_details(url):
 
     data["image_url"] = scrape_main_image(url, soup)
 
+    # Térkép és távolság számítása
     megtekintes_hely = data.get("megtekintes_hely", "")
     if megtekintes_hely:
-        result = get_drive_distance(megtekintes_hely)
-        data["tavolsag"] = f"{result[0]} km ({result[1]} perc)" if result else "Nem sikerült kiszámítani"
+        coords = geocode_address(megtekintes_hely)
+        if coords:
+            lat, lon = coords
+            data["maps_url"] = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
+            result = get_drive_distance(lat, lon)
+            data["tavolsag"] = f"{result[0]} km ({result[1]} perc autóval)" if result else "Nem sikerült kiszámítani"
+        else:
+            data["tavolsag"] = "N/A"
     else:
         data["tavolsag"] = "N/A"
 
@@ -248,34 +265,66 @@ def get_emails_since(since_date):
         return []
 
 
-# =================== IDEIGLENES MBVK-STÍLUSÚ PAPSÁG ===================
+# =================== MBVK STÍLUSÚÜZENET ÖSSZEÁLLÍTÁS ===================
 
 async def send_auction_message(a: dict):
-    # Az MBVK botokhoz hasonló, letisztultabb struktúra
-    caption = f"🏠 <b>{a.get('cim', 'Ismeretlen ingatlan')}</b>\n\n"
+    lines = ["🆕 *NAV INGATLAN TALÁLAT*", ""]
     
-    caption += f"💰 <b>Becsérték:</b> {a.get('becsertek', 'N/A')}\n"
-    caption += f"📉 <b>Minimálár:</b> {a.get('minimal_ajanlat', 'N/A')}\n\n"
+    # 1. Elhelyezkedés és Alapadatok
+    lines.append("🌍 *1. Elhelyezkedés és Alapadatok*")
+    lines.append(f"📍 *Cím:* {escape_markdown(a.get('cim', 'N/A'))}")
     
-    caption += f"📅 <b>Kezdet:</b> {a.get('kezdet', 'N/A')}\n"
-    caption += f"⏳ <b>Vége:</b> {a.get('befejezes', 'N/A')}\n\n"
-    
-    caption += f"📍 <b>Helyszín:</b> {a.get('megtekintes_hely', 'N/A')}\n"
-    caption += f"🚗 <b>Távolság (XVII. ker):</b> {a.get('tavolsag', 'N/A')}\n\n"
-    
-    if a.get("egyeb_info"):
-        caption += f"📝 <b>Leírás:</b> <i>{a['egyeb_info'][:300]}...</i>\n\n"
+    megye_str = escape_markdown(a.get("megye", ""))
+    if megye_str:
+        lines.append(f"🏛 *Megye:* {megye_str}")
         
-    caption += f"🔗 <a href='{a['url']}'>Árverési adatlap megnyitása</a>"
+    dist_str = escape_markdown(a.get("tavolsag", ""))
+    if dist_str and dist_str != "N/A":
+        lines.append(f"🗺 *Budapest-távolság:* {dist_str}")
+    lines.append("")
+    
+    # 2. Az Ingatlan és a Telek Jellemzői
+    lines.append("🏠 *2. Az Ingatlan és a Telek Jellemzői*")
+    allapot = escape_markdown(a.get("allapot", "igen"))
+    lines.append(f"🚪 *Beköltözhető / Állapot:* {allapot}")
+    lines.append("")
+    
+    # 3. Pénzügyi Információk
+    lines.append("💰 *3. Pénzügyi Információk*")
+    lines.append(f"💵 *Jelenlegi ár / Becsérték:* {escape_markdown(a.get('becsertek', 'N/A'))}")
+    lines.append(f"📉 *Minimál ajánlat:* {escape_markdown(a.get('minimal_ajanlat', 'N/A'))}")
+    lines.append("")
+    
+    # 4. Jogi és Árverési Státusz
+    lines.append("⚖️ *4. Jogi és Árverési Státusz*")
+    lines.append(f"▶️ *Árverés kezdete:* {escape_markdown(a.get('kezdet', 'N/A'))}")
+    lines.append(f"📅 *Árverés vége:* {escape_markdown(a.get('befejezes', 'N/A'))}")
+    lines.append("")
+    
+    # Leírás kezelése
+    leiras = a.get("egyeb_info", "")
+    if leiras:
+        lines.append(f"📝 *Leírás:*\n_{escape_markdown(leiras[:400])}_")
+        lines.append("")
+        
+    # Linkek formázása
+    lines.append(f"🔗 [Részletek az NAV oldalon]({a.get('url', '')})")
+    
+    maps_url = a.get("maps_url", "")
+    if maps_url:
+        lines.append(f"🗺 [Google Térkép]({maps_url})")
 
+    text = "\n".join(lines)
     image_bytes = download_image(a.get("image_url")) if a.get("image_url") else None
+    
     try:
         if image_bytes:
-            await bot.send_photo(chat_id=CHAT_ID, photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
+            await bot.send_photo(chat_id=CHAT_ID, photo=io.BytesIO(image_bytes), caption=text, parse_mode="Markdown")
         else:
-            await bot.send_message(chat_id=CHAT_ID, text=caption, parse_mode="HTML", disable_web_page_preview=True)
+            await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown", disable_web_page_preview=False)
+        logger.info(f"Telegram elküldve: {a.get('cim')}")
     except Exception as e:
-        logger.error(f"Hiba az üzenetküldésnél: {e}")
+        logger.error(f"Telegram küldési hiba: {e}")
 
 
 async def send_telegram_messages(auctions: list):
@@ -305,7 +354,7 @@ def main():
 
     unique = list({a["url"]: a for a in all_auctions}.values())
     
-    # KIZÁRÓLAG INGATLANOK MEGTARTÁSA
+    # KIZÁRÓLAG AZ INGATLANOK SZŰRÉSE
     real_estate_auctions = [
         a for a in unique 
         if "ingatlan" in a.get("kategoria", "").lower() 
