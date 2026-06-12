@@ -697,23 +697,20 @@ def build_mnv_ear_message(a: dict) -> str:
     kezdet = escape_html(a.get("kezdet") or "N/A")
     befejezes = escape_html(a.get("befejezes") or "N/A")
 
-    # MÓDOSÍTVA: MNV EAR dinamikus link előállítása az azonosítóból
+    # MNV EAR dinamikus link előállítása az azonosítóból (javítva a valós formátumra)
     mnv_id = a.get("mnv_id")  # pl. "50002/260611"
     auction_link = "#"
     if mnv_id:
         match = re.match(r'(\d+)/', mnv_id)
         if match:
             auction_id = match.group(1)
-            auction_link = f"https://e-arveres.mnv.hu/?actionId=action.auction.AuctionSummaryAction&auctionId={auction_id}&FRAME_SKIP_DEJAVU=1"
+            # Helyes link: https://e-arveres.mnv.hu//index-ingosag.html?.actionId=...&auctionId=...
+            auction_link = f"https://e-arveres.mnv.hu//index-ingosag.html?.actionId=action.auction.AuctionSummaryAction&auctionId={auction_id}&FRAME_SKIP_DEJAVU=1"
 
     reszletek = f"Kikiáltási ár: {a.get('kikialtas_ar', 'N/A')} | MNV EAR árverés"
     kezdet_url = generate_gcal_url(f"MNV Árverés Kezdete: {a.get('cim_rovid', '')}", kezdet, "", reszletek)
     befejezes_url = generate_gcal_url(f"MNV Árverés Vége: {a.get('cim_rovid', '')}", befejezes, "", reszletek)
-    
-    # MÓDOSÍTVA: Biztosíték határidejéhez naptár link generálása
-    hatarido_url = None
-    if hatarido:
-        hatarido_url = generate_gcal_url(f"MNV Biztosíték határideje: {a.get('cim_rovid', '')}", hatarido, "", reszletek)
+    hatarido_url = generate_gcal_url(f"MNV Biztosíték határideje: {a.get('cim_rovid', '')}", hatarido, "", reszletek) if hatarido else None
 
     lines = [
         "🏛 <b>MNV EAR INGATLAN TALÁLAT</b>",
@@ -745,7 +742,6 @@ def build_mnv_ear_message(a: dict) -> str:
     else:
         lines.append(f"🏁 <b>Befejezés:</b> {befejezes}")
 
-    # MÓDOSÍTVA: dinamikus link használata
     lines.extend([
         "",
         f"🔗 <a href='{auction_link}'>Megnyitás az MNV EAR rendszerben</a>",
@@ -782,7 +778,7 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
             "chat_id": target_chat_id,
             "text": caption,
             "parse_mode": "HTML",
-            "disable_web_page_preview": True,    # linkelőnézet kikapcsolva
+            "disable_web_page_preview": True,
         }
         resp = requests.post(url, data=data, timeout=20)
         if resp.status_code == 200:
