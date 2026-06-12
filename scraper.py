@@ -520,7 +520,7 @@ def build_ingatlan_message(a: dict) -> str:
         f"📋 <b>{arveres_nev}</b>",
         "",
         "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
-        f"🏷 <b>Megnevezés/Cím:</b> {ingatlan_nev}",
+        f"🏷 <b>Megnevezés:</b> {ingatlan_nev}",
         f"📍 <b>Cím:</b> {teljes_cim}",
     ]
 
