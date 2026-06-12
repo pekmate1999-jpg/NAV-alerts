@@ -103,54 +103,67 @@ def is_real_estate(auction: dict) -> bool:
     return any(kw in szoveg for kw in keywords)
 
 
-def build_combined_message(group_name: str, items: list) -> str:
-    """Egy csoport üzenetének összeállítása (kategória nélkül, HTML escape-el)."""
+def build_safe_caption(group_name: str, items: list) -> str:
+    """
+    Összeállít egy caption-t, amely biztosan nem haladja meg a 1024 karaktert,
+    és nem vágja ketté a HTML tag-eket.
+    A leírás (5. pont) hosszát dinamikusan csökkenti, ha szükséges.
+    """
     first = items[0]
-    caption = f"🏛️ <b>{group_name}</b>\n\n"
+    MAX_LEN = 1024
 
-    # 1. Alapadatok
-    caption += "📦 <b>1. Tétel alapadatok</b>\n"
+    # 1. Alapadatok blokk (kategória nélkül)
+    base = f"🏛️ <b>{group_name}</b>\n\n"
+    base += "📦 <b>1. Tétel alapadatok</b>\n"
     if first.get("allapot"):
-        caption += f"📊 Állapot: {first.get('allapot')}\n"
+        base += f"📊 Állapot: {first.get('allapot')}\n"
     if first.get("darabszam"):
-        caption += f"🔢 Darabszám: {first.get('darabszam')}\n"
-    caption += "\n"
+        base += f"🔢 Darabszám: {first.get('darabszam')}\n"
+    base += "\n"
 
     # 2. Pénzügyi információk
-    caption += "💰 <b>2. Pénzügyi információk</b>\n"
-    caption += f"💵 Becsérték: {first.get('becsertek', 'N/A')}\n"
-    caption += f"💸 Minimál ajánlat: {first.get('minimal_ajanlat', 'N/A')}\n"
-    caption += "\n"
+    base += "💰 <b>2. Pénzügyi információk</b>\n"
+    base += f"💵 Becsérték: {first.get('becsertek', 'N/A')}\n"
+    base += f"💸 Minimál ajánlat: {first.get('minimal_ajanlat', 'N/A')}\n"
+    base += "\n"
 
     # 3. Időpontok
-    caption += "📅 <b>3. Időpontok</b>\n"
-    caption += f"▶️ Kezdés: {first.get('kezdet', 'N/A')}\n"
-    caption += f"⏹️ Befejezés: {first.get('befejezes', 'N/A')}\n"
-    caption += "\n"
+    base += "📅 <b>3. Időpontok</b>\n"
+    base += f"▶️ Kezdés: {first.get('kezdet', 'N/A')}\n"
+    base += f"⏹️ Befejezés: {first.get('befejezes', 'N/A')}\n"
+    base += "\n"
 
     # 4. Megtekintés
-    caption += "📍 <b>4. Megtekintés</b>\n"
-    caption += f"🗺️ Helyszín: {first.get('megtekintes_hely', 'N/A')}\n"
-    caption += f"🕐 Időpont: {first.get('megtekintes_ido', 'N/A')}\n"
-    caption += f"🚗 Távolság: {first.get('tavolsag', 'N/A')}\n"
-    caption += "\n"
+    base += "📍 <b>4. Megtekintés</b>\n"
+    base += f"🗺️ Helyszín: {first.get('megtekintes_hely', 'N/A')}\n"
+    base += f"🕐 Időpont: {first.get('megtekintes_ido', 'N/A')}\n"
+    base += f"🚗 Távolság: {first.get('tavolsag', 'N/A')}\n"
+    base += "\n"
 
-    # 5. Leírás – HTML escape
-    if first.get("egyeb_info"):
-        escaped_desc = html_escape.escape(first['egyeb_info'][:250])
-        caption += "📝 <b>5. Leírás</b>\n"
-        caption += f"<i>{escaped_desc}</i>\n\n"
-
-    # Linkek
+    # 5. Leírás – később adjuk hozzá, hogy csökkenthessük
+    # Először összerakjuk a linkeket
     if len(items) == 1:
-        caption += f"🔗 <a href='{items[0]['url']}'>Részletek megtekintése</a>"
+        link_part = f"🔗 <a href='{items[0]['url']}'>Részletek megtekintése</a>"
     else:
-        caption += "🔗 <b>Linkek az egyes tételekhez:</b>\n"
+        link_part = "🔗 <b>Linkek az egyes tételekhez:</b>\n"
         for idx, item in enumerate(items, 1):
-            caption += f"{idx}. <a href='{item['url']}'>Tétel linkje</a>\n"
+            link_part += f"{idx}. <a href='{item['url']}'>Tétel linkje</a>\n"
 
-    if len(caption) > 1024:
-        caption = caption[:1020] + "…"
+    # Most megnézzük, mennyi hely marad a leírásnak
+    desc_text = first.get("egyeb_info", "")
+    escaped_desc = html_escape.escape(desc_text)
+    # Ha túl hosszú, rövidítjük
+    max_desc_len = MAX_LEN - len(base) - len(link_part) - 50  # 50 biztonsági tartalék
+    if max_desc_len < 50:
+        # Ha nagyon kevés hely van, nem küldünk leírást
+        desc_part = ""
+    else:
+        if len(escaped_desc) > max_desc_len:
+            # Levágjuk és hozzáadjuk a "…" jelet
+            escaped_desc = escaped_desc[:max_desc_len-3] + "…"
+        desc_part = f"📝 <b>5. Leírás</b>\n<i>{escaped_desc}</i>\n\n"
+
+    caption = base + desc_part + link_part
     return caption
 
 
@@ -185,7 +198,7 @@ def send_grouped_messages(groups: dict, target_bot: Bot, target_chat_id: str, ca
         logger.error(f"Összefoglaló fejléc hiba ({category_label}): {e}")
 
     for group_name, items in groups.items():
-        caption = build_combined_message(group_name, items)
+        caption = build_safe_caption(group_name, items)
         first_item = items[0]
         image_url = first_item.get("image_url")
         image_bytes = download_image(image_url) if image_url else None
@@ -223,16 +236,11 @@ def extract_links_from_text(text: str) -> list:
     """Kinyeri a NAV EAF linkeket sima szöveges tartalomból (reguláris kifejezéssel)."""
     pattern = r'https?://arveres\.nav\.gov\.hu[^\s"\'>]+'
     links = re.findall(pattern, text)
-    # Szűrés: csak azok, amelyek tartalmazzák az auctionId vagy item=auctionSummary paramétert
-    filtered = []
-    for link in links:
-        if 'auctionId' in link or 'item=auctionSummary' in link:
-            filtered.append(link)
+    filtered = [link for link in links if 'auctionId' in link or 'item=auctionSummary' in link]
     return list(set(filtered))
 
 
 def extract_nav_eaf_links(html_content):
-    """Először HTML-ből próbál linkeket kinyerni, ha nincs, akkor szövegesen."""
     soup = BeautifulSoup(html_content, "html.parser")
     links = []
     for a in soup.find_all("a", href=True):
@@ -243,7 +251,6 @@ def extract_nav_eaf_links(html_content):
             href = href.replace("nav.gov.hu//", "nav.gov.hu/")
             links.append(href)
     if not links:
-        # Ha nem találtunk HTML linkeket, próbáljuk a szöveges kinyerést
         links = extract_links_from_text(html_content)
         if links:
             logger.info(f"Szöveges kinyeréssel talált linkek: {links}")
@@ -544,7 +551,7 @@ def get_unread_nav_emails():
 # =================== Fő logika ===================
 
 def main():
-    logger.info(f"=== NAV EAF Scraper v2.05 (teljes javítás) indítás: {datetime.now().strftime('%Y.%m.%d %H:%M')} ===")
+    logger.info(f"=== NAV EAF Scraper v2.06 (biztonságos caption, ingatlan javítás) indítás: {datetime.now().strftime('%Y.%m.%d %H:%M')} ===")
 
     seen_urls = load_seen_urls()
     logger.info(f"Már ismert URL-ek száma: {len(seen_urls)}")
