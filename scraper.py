@@ -75,10 +75,16 @@ def save_seen_urls(seen: set):
 def generate_gcal_url(title, date_str, location="", details=""):
     """
     Készít egy Google Calendar URL-t a megadott adatokból.
-    Felismeri a sima dátumokat és a '-tól -ig' formátumokat is.
+    Átváltja UTC-vé és ctz paramétert ad hozzá, hogy mobilon/appban se legyen egész napos hiba.
     """
     if not date_str or date_str == "N/A":
         return None
+
+    try:
+        import zoneinfo
+        bp_tz = zoneinfo.ZoneInfo("Europe/Budapest")
+    except Exception:
+        bp_tz = None
 
     try:
         # Keresünk minden dátum-idő formátumot a szövegben (YYYY-MM-DD HH:MM)
@@ -97,14 +103,24 @@ def generate_gcal_url(title, date_str, location="", details=""):
             # Ha nincs befejezés, alapértelmezetten 1 órás eseményt csinálunk
             end_dt = start_dt + timedelta(hours=1)
 
-        # Google Naptár formátum (időzóna nélkül a helyi időt használja)
-        start_str = start_dt.strftime("%Y%m%dT%H%M%00")
-        end_str = end_dt.strftime("%Y%m%dT%H%M%00")
+        # Ha elérhető a zoneinfo, átváltjuk UTC-re (a mobil appok szigorúan ezt kérik)
+        if bp_tz:
+            start_dt = start_dt.replace(tzinfo=bp_tz)
+            end_dt = end_dt.replace(tzinfo=bp_tz)
+            start_utc = start_dt.astimezone(timezone.utc)
+            end_utc = end_dt.astimezone(timezone.utc)
+            start_str = start_utc.strftime("%Y%m%dT%H%M00Z")
+            end_str = end_utc.strftime("%Y%m%dT%H%M00Z")
+        else:
+            # Biztonsági mentés (Javítva a %00 elírás 00-ra!)
+            start_str = start_dt.strftime("%Y%m%dT%H%M00")
+            end_str = end_dt.strftime("%Y%m%dT%H%M00")
 
         # URL összeállítása
         url = f"https://calendar.google.com/calendar/render?action=TEMPLATE"
         url += f"&text={urllib.parse.quote(title)}"
         url += f"&dates={start_str}/{end_str}"
+        url += f"&ctz=Europe/Budapest"  # Kényszerített időre zóna a mobilos deep-linkekhez
         
         if location and location != "N/A":
             url += f"&location={urllib.parse.quote(location)}"
@@ -400,7 +416,7 @@ def parse_nav_eaf_details(url):
         coords = geocode_address(geocode_input)
         if coords:
             lat, lon = coords
-            data["maps_url"] = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
+            data["maps_url"] = f"http://maps.google.com/?q={lat},{lon}"
             result = get_drive_distance(coords)
             data["tavolsag"] = (
                 f"{result[0]} km ({result[1]} perc autóval)" if result
@@ -413,7 +429,7 @@ def parse_nav_eaf_details(url):
             coords = geocode_address(data["teljes_cim"])
             if coords:
                 lat, lon = coords
-                data["maps_url"] = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}"
+                data["maps_url"] = f"http://maps.google.com/?q={lat},{lon}"
                 result = get_drive_distance(coords)
                 data["tavolsag"] = (
                     f"{result[0]} km ({result[1]} perc autóval)" if result
