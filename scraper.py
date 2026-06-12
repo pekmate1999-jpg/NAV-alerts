@@ -228,22 +228,23 @@ def get_emails_since(since_date):
         mail.login(EMAIL, PASSWORD)
         mail.select("inbox")
 
-        search_criteria = f'(SINCE "{since_date.strftime("%d-%b-%Y")}")'
+        # SZŰRÉS: Kizárólag az OLVASATLAN (UNSEEN) levelek lekérése, amik a megadott dátum óta érkeztek
+        search_criteria = f'(UNSEEN SINCE "{since_date.strftime("%d-%b-%Y")}")'
         logger.info(f"Keresési feltétel küldése: {search_criteria}")
         status, messages = mail.search(None, search_criteria)
         
         if status != "OK" or not messages[0]:
-            logger.info("Nem található levél a megadott dátum óta.")
+            logger.info("Nem található ÚJ, OLVASATLAN levél a megadott dátum óta.")
             mail.close()
             mail.logout()
             return []
 
         msg_ids = messages[0].split()
-        logger.info(f"Talált e-mailek száma összesen: {len(msg_ids)}")
+        logger.info(f"Talált olvasatlan e-mailek száma összesen: {len(msg_ids)}")
         
         result = []
         for idx, eid in enumerate(msg_ids, 1):
-            logger.info(f" -> [{idx}/{len(msg_ids)}] E-mail letöltése (ID: {eid.decode()})...")
+            logger.info(f" -> [{idx}/{len(msg_ids)}] Olvasatlan e-mail letöltése (ID: {eid.decode()})...")
             status, msg_data = mail.fetch(eid, "(RFC822)")
             if status != "OK": continue
             
@@ -256,6 +257,8 @@ def get_emails_since(since_date):
                 html_body = extract_html_from_message(msg)
                 if html_body:
                     result.append(html_body)
+            
+            # A levél olvasottnak jelölése, hogy legközelebb ne nézze meg újra
             mail.store(eid, "+FLAGS", "\\Seen")
         
         mail.close()
@@ -266,11 +269,9 @@ def get_emails_since(since_date):
         return []
 
 
-# =================== Üzenetküldés tiszta HTTP-vel (Golyóálló) ===================
+# =================== Üzenetküldés tiszta HTTP-vel ===================
 
 def send_via_requests(caption, image_url=None):
-    """Közvetlen API hívás requests segítségével, nincs szükség telegram könyvtárra."""
-    # 1. Kép letöltése és küldése bájtként (ha van kép)
     if image_url:
         try:
             img_resp = requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
@@ -287,7 +288,6 @@ def send_via_requests(caption, image_url=None):
         except Exception as e:
             logger.warning(f"Nem sikerült a képet letölteni/küldeni, megpróbáljuk sima szövegként: {e}")
 
-    # 2. Sima szöveges küldés (Ha nem volt kép, vagy a képküldés elhasalt)
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         data = {'chat_id': CHAT_ID, 'text': caption, 'parse_mode': 'HTML', 'disable_web_page_preview': False}
@@ -355,14 +355,13 @@ def main():
     
     emails_html = get_emails_since(since)
     if not emails_html:
-        logger.info("Nincs új feldolgozandó e-mail.")
+        logger.info("Nincs új, olvasatlan feldolgozandó e-mail.")
         return
 
     all_auctions = []
     for html in emails_html:
         links = extract_nav_eaf_links(html)
         for link in links:
-            # Csak ha még nem láttuk korábban
             if link not in seen_urls:
                 details = parse_nav_eaf_details(link)
                 if details:
@@ -370,10 +369,8 @@ def main():
             else:
                 logger.info(f"Már feldolgozott link kihagyása: {link}")
 
-    # Aktuális futáson belüli egyediesítés
     unique = list({a["url"]: a for a in all_auctions}.values())
     
-    # Szigorú szűrés ingatlanokra
     real_estate_auctions = [
         a for a in unique 
         if "ingatlan" in a.get("kategoria", "").lower() 
