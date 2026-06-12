@@ -44,7 +44,15 @@ CSAK_1_1_TULAJDON = True
 
 # Ingóság szűrő: Csak a megadott HUF érték ALATTI becsértékű ingóságokról küld értesítést.
 # Ha ki szeretnéd kapcsolni ezt a korlátot, állítsd None-ra (pl. MAX_INGOSAG_BECSERTEK = None).
-MAX_INGOSAG_BECSERTEK = 2000000  
+MAX_INGOSAG_BECSERTEK = 2000000
+
+# MNV EAR szűrő: Csak a megadott HUF érték ALATTI kikiáltási árú ingatlanokról küld értesítést.
+# A hírlevélből közvetlenül, scraping nélkül kerülnek kinyerésre.
+MAX_MNV_KIKIALTAS = 2000000
+
+# ------------------- FELADÓ SZŰRŐK -------------------
+# Csak ezen domain-ekről érkező, VAGY ezeket tartalmazó forwarded levelek kerülnek feldolgozásra.
+NAV_SENDER_DOMAINS = ["nav.gov.hu", "mnv.hu"]
 
 
 # =================== Látott URL-ek kezelése ===================
@@ -468,7 +476,61 @@ def extract_html_from_message(msg):
     return None
 
 
+def _decode_subject(msg) -> str:
+    subject_parts = decode_header(msg.get("Subject", ""))
+    return "".join([
+        p.decode(e or "utf-8", errors="ignore") if isinstance(p, bytes) else p
+        for p, e in subject_parts
+    ])
+
+
+def _classify_email(msg, subject_str: str, html_body: str) -> str:
+    """
+    Visszaadja a levél típusát:
+      'nav_eaf' – NAV Elektronikus Árverés (közvetlenül vagy forwarded)
+      'mnv_ear' – MNV EAR Heti hírlevél (közvetlenül vagy forwarded)
+      'skip'    – nem releváns, kihagyandó
+    Csak NAV/MNV domain-ről érkező vagy tőlük forwarded leveleket fogad el.
+    """
+    from_header = msg.get("From", "").lower()
+    subj_l = subject_str.lower()
+    html_l = (html_body or "").lower()
+
+    # --- MNV EAR felismerés ---
+    mnv_signals = [
+        any(d in from_header for d in ["mnv.hu"]),
+        "mnv ear" in subj_l,
+        "heti hírlevél" in subj_l,
+        "heti hirlevél" in subj_l,
+        "meghirdetett árverésekről" in subj_l,
+        "no-reply-ear@mnv.hu" in html_l,
+        "ear.mnv.hu" in html_l,
+        # forwarded esetén a törzsben szerepelhet a feladó
+        ("mnv" in html_l and "ear" in html_l and "hírlevél" in html_l),
+    ]
+    if any(mnv_signals):
+        return "mnv_ear"
+
+    # --- NAV EAF felismerés ---
+    nav_signals = [
+        any(d in from_header for d in ["nav.gov.hu"]),
+        "elektronikus árverés" in subj_l,
+        "elektronikus arveres" in subj_l,
+        "eaf@nav.gov.hu" in html_l,
+        "arveres.nav.gov.hu" in html_l,
+    ]
+    if any(nav_signals):
+        return "nav_eaf"
+
+    return "skip"
+
+
 def get_emails_since(since_date):
+    """
+    Visszaadja az olvasatlan NAV/MNV levelek HTML tartalmát két listában:
+      (nav_eaf_htmls, mnv_ear_htmls)
+    Csak NAV EAF vagy MNV EAR feladóktól (vagy tőlük forwarded) érkező leveleket dolgoz fel.
+    """
     try:
         logger.info("Kapcsolódás a Gmail IMAP szerverhez...")
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -484,39 +546,150 @@ def get_emails_since(since_date):
             logger.info("Nem található ÚJ, OLVASATLAN levél a megadott dátum óta.")
             mail.close()
             mail.logout()
-            return []
+            return [], []
 
         msg_ids = messages[0].split()
         logger.info(f"Talált olvasatlan e-mailek száma összesen: {len(msg_ids)}")
 
-        result = []
+        nav_eaf_htmls = []
+        mnv_ear_htmls = []
+
         for idx, eid in enumerate(msg_ids, 1):
-            logger.info(f" -> [{idx}/{len(msg_ids)}] Olvasatlan e-mail letöltése (ID: {eid.decode()})...")
+            logger.info(f" -> [{idx}/{len(msg_ids)}] E-mail letöltése (ID: {eid.decode()})...")
             status, msg_data = mail.fetch(eid, "(RFC822)")
             if status != "OK":
                 continue
 
             msg = email.message_from_bytes(msg_data[0][1])
-            subject_parts = decode_header(msg.get("Subject", ""))
-            subject_str = "".join([
-                p.decode(e or "utf-8", errors="ignore") if isinstance(p, bytes) else p
-                for p, e in subject_parts
-            ])
+            subject_str = _decode_subject(msg)
+            html_body = extract_html_from_message(msg)
 
-            if "Elektronikus Árverés" in subject_str or "Elektronikus Arveres" in subject_str:
-                logger.info(f"    * Találat: Árverési levél! Tárgy: {subject_str}")
-                html_body = extract_html_from_message(msg)
+            email_type = _classify_email(msg, subject_str, html_body)
+
+            if email_type == "nav_eaf":
+                logger.info(f"    * NAV EAF levél! Tárgy: {subject_str}")
                 if html_body:
-                    result.append(html_body)
-
-            mail.store(eid, "+FLAGS", "\\Seen")
+                    nav_eaf_htmls.append(html_body)
+                mail.store(eid, "+FLAGS", "\\Seen")
+            elif email_type == "mnv_ear":
+                logger.info(f"    * MNV EAR hírlevél! Tárgy: {subject_str}")
+                if html_body:
+                    mnv_ear_htmls.append(html_body)
+                mail.store(eid, "+FLAGS", "\\Seen")
+            else:
+                logger.info(f"    * Nem NAV/MNV levél, kihagyás. Feladó: {msg.get('From', '')} | Tárgy: {subject_str}")
 
         mail.close()
         mail.logout()
-        return result
+        return nav_eaf_htmls, mnv_ear_htmls
     except Exception as e:
         logger.error(f"IMAP hiba történt: {e}")
-        return []
+        return [], []
+
+
+# =================== MNV EAR hírlevél feldolgozása (scraping nélkül) ===================
+
+MNV_FIELD_MAP = {
+    "Árverés alkategória neve":                   "alkategoria",
+    "Árverezett tétel megnevezése, azonosítója":  "tetel_nev_azonosito",
+    "Kikiáltási ár":                              "kikialtas_ar",
+    "Meghirdetési dátum és idő":                  "meghirdetes",
+    "Biztosíték megfizetésének határideje":        "biztosítek_hatarido",
+    "Kezdési dátum és idő":                       "kezdet",
+    "Befejezési dátum és idő":                    "befejezes",
+}
+
+
+def parse_mnv_ear_auctions(html_content: str) -> list:
+    """
+    Az MNV EAR hírlevél HTML-jéből közvetlenül kinyeri az árverési tételeket,
+    scraping nélkül. Minden táblázatot megvizsgál; ha tartalmaz árverési mezőket,
+    dict-ként hozzáadja a listához.
+    """
+    soup = BeautifulSoup(html_content, "html.parser")
+    auctions = []
+
+    for table in soup.find_all("table"):
+        auction_data = {}
+        for row in table.find_all("tr"):
+            cells = row.find_all("td")
+            if len(cells) < 2:
+                continue
+            key = clean_text(cells[0].get_text())
+            value = clean_text(cells[1].get_text())
+            if not key or not value:
+                continue
+            for field_key, dict_key in MNV_FIELD_MAP.items():
+                if field_key in key:
+                    auction_data[dict_key] = value
+                    break
+
+        # Csak akkor vesszük fel, ha van legalább tétel és ár
+        if "tetel_nev_azonosito" in auction_data and "kikialtas_ar" in auction_data:
+            # Egyedi azonosító kinyerése: pl. [49881/260608]
+            id_match = re.search(r'\[(\d+/\d+)\]', auction_data.get("tetel_nev_azonosito", ""))
+            auction_data["mnv_id"] = id_match.group(1) if id_match else None
+
+            # Cím kinyerése a tétel nevéből (szögletes és kerek zárójelek előtti rész)
+            raw_nev = auction_data.get("tetel_nev_azonosito", "")
+            cim_match = re.match(r'^(.*?)(?:\s*[\[\(])', raw_nev)
+            auction_data["cim_rovid"] = cim_match.group(1).strip() if cim_match else raw_nev
+
+            auctions.append(auction_data)
+
+    logger.info(f"MNV EAR: {len(auctions)} tétel kinyerve az e-mailből.")
+    return auctions
+
+
+def build_mnv_ear_message(a: dict) -> str:
+    """Telegram értesítő MNV EAR hírlevélből kinyert ingatlanhoz."""
+    alkategoria = escape_html(a.get("alkategoria") or "Ingatlan")
+    tetel = escape_html(a.get("tetel_nev_azonosito") or "Ismeretlen")
+    cim = escape_html(a.get("cim_rovid") or tetel)
+    ar = escape_html(a.get("kikialtas_ar") or "N/A")
+    meghirdetes = escape_html(a.get("meghirdetes") or "N/A")
+    hatarido = escape_html(a.get("biztosítek_hatarido") or "")
+    kezdet = escape_html(a.get("kezdet") or "N/A")
+    befejezes = escape_html(a.get("befejezes") or "N/A")
+
+    reszletek = f"Kikiáltási ár: {a.get('kikialtas_ar', 'N/A')} | MNV EAR árverés"
+    kezdet_url = generate_gcal_url(f"MNV Árverés Kezdete: {a.get('cim_rovid', '')}", kezdet, cim, reszletek)
+    befejezes_url = generate_gcal_url(f"MNV Árverés Vége: {a.get('cim_rovid', '')}", befejezes, cim, reszletek)
+
+    lines = [
+        "🏛 <b>MNV EAR INGATLAN TALÁLAT</b>",
+        f"📋 <b>{alkategoria}</b>",
+        "",
+        "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
+        f"🏷 <b>Tétel:</b> {tetel}",
+        f"📍 <b>Cím:</b> {cim}",
+        "",
+        "💰 <b>2. Pénzügyi Információk</b>",
+        f"💵 <b>Kikiáltási ár:</b> {ar}",
+        "",
+        "📅 <b>3. Időpontok</b>",
+        f"📢 <b>Meghirdetve:</b> {meghirdetes}",
+    ]
+
+    if hatarido:
+        lines.append(f"⏰ <b>Biztosíték határideje:</b> {hatarido}")
+
+    if kezdet_url:
+        lines.append(f"▶️ <b>Kezdés:</b> <a href='{kezdet_url}'>{kezdet}</a>")
+    else:
+        lines.append(f"▶️ <b>Kezdés:</b> {kezdet}")
+
+    if befejezes_url:
+        lines.append(f"🏁 <b>Befejezés:</b> <a href='{befejezes_url}'>{befejezes}</a>")
+    else:
+        lines.append(f"🏁 <b>Befejezés:</b> {befejezes}")
+
+    lines.extend([
+        "",
+        "🔗 <a href='https://ear.mnv.hu'>Megnyitás az MNV EAR rendszerben</a>",
+    ])
+
+    return "\n".join(lines)
 
 
 # =================== Telegram üzenetküldés ===================
@@ -806,13 +979,17 @@ def main():
     since = datetime.now(timezone.utc) - timedelta(days=1)
     seen_urls = load_seen_urls()
 
-    emails_html = get_emails_since(since)
-    if not emails_html:
-        logger.info("Nincs új, olvasatlan feldolgozandó e-mail.")
+    nav_eaf_htmls, mnv_ear_htmls = get_emails_since(since)
+
+    if not nav_eaf_htmls and not mnv_ear_htmls:
+        logger.info("Nincs új, olvasatlan NAV/MNV e-mail feldolgozásra.")
         return
 
+    # =====================================================================
+    # 1. NAV EAF feldolgozás – meglévő scraping logika
+    # =====================================================================
     all_auctions = []
-    for html in emails_html:
+    for html in nav_eaf_htmls:
         links = extract_nav_eaf_links(html)
         for link in links:
             if link not in seen_urls:
@@ -820,10 +997,10 @@ def main():
                 if details:
                     all_auctions.append(details)
             else:
-                logger.info(f"Már feldolgozott link kihagyása: {link}")
+                logger.info(f"Már feldolgozott NAV link kihagyása: {link}")
 
     unique_auctions = list({a["url"]: a for a in all_auctions}.values())
-    logger.info(f"Összes új feldolgozandó tétel száma: {len(unique_auctions)}")
+    logger.info(f"Összes új NAV EAF feldolgozandó tétel: {len(unique_auctions)}")
 
     for a in unique_auctions:
         kategoria_szoveg = (
@@ -831,7 +1008,7 @@ def main():
         ).lower()
         is_real_estate = "ingatlan" in kategoria_szoveg
 
-        # ---- SZŰRÉSI LOGIKA ALKALMAZÁSA ----
+        # ---- SZŰRÉSI LOGIKA ----
         if is_real_estate:
             if CSAK_1_1_TULAJDON:
                 tulajdon = a.get("tulajdoni_hanyad", "")
@@ -844,7 +1021,7 @@ def main():
                 if becsertek_int > MAX_INGOSAG_BECSERTEK:
                     logger.info(f"-> [SZŰRŐ] Ingóság kihagyva (Becsérték > {MAX_INGOSAG_BECSERTEK} HUF): {a.get('cim')} ({a.get('becsertek')})")
                     continue
-        # -------------------------------------
+        # ------------------------
 
         if is_real_estate:
             token = REAL_ESTATE_BOT_TOKEN
@@ -862,6 +1039,48 @@ def main():
             logger.error(
                 f"Kihagyva! Hiányzó token vagy chat_id (Ingatlan volt? {is_real_estate})"
             )
+
+    # =====================================================================
+    # 2. MNV EAR feldolgozás – közvetlenül a hírlevélből, scraping nélkül
+    # =====================================================================
+    all_mnv = []
+    for html in mnv_ear_htmls:
+        all_mnv.extend(parse_mnv_ear_auctions(html))
+
+    logger.info(f"Összes MNV EAR tétel az e-mail(ek)ből: {len(all_mnv)}")
+
+    for a in all_mnv:
+        mnv_id = a.get("mnv_id")
+        mnv_key = f"mnv_ear_{mnv_id}" if mnv_id else None
+
+        # Duplikát ellenőrzés
+        if mnv_key and mnv_key in seen_urls:
+            logger.info(f"Már feldolgozott MNV tétel kihagyása: {a.get('tetel_nev_azonosito')}")
+            continue
+
+        # Kikiáltási ár szűrés – csak 2 M Ft alattiak
+        kikialtas_int = parse_price_to_int(a.get("kikialtas_ar", ""))
+        if kikialtas_int == 0:
+            logger.warning(f"-> [MNV] Nem sikerült az árat értelmezni: {a.get('tetel_nev_azonosito')}")
+        if kikialtas_int >= MAX_MNV_KIKIALTAS:
+            logger.info(
+                f"-> [SZŰRŐ] MNV tétel kihagyva (Kikiáltási ár {kikialtas_int:,} Ft >= {MAX_MNV_KIKIALTAS:,} Ft): "
+                f"{a.get('tetel_nev_azonosito')}"
+            )
+            continue
+
+        logger.info(
+            f"-> [MNV ROUTING] Küldés az Ingatlan Botnak: "
+            f"{a.get('tetel_nev_azonosito')} | {a.get('kikialtas_ar')}"
+        )
+
+        if REAL_ESTATE_BOT_TOKEN and REAL_ESTATE_CHAT_ID:
+            msg = build_mnv_ear_message(a)
+            send_via_requests(msg, None, REAL_ESTATE_BOT_TOKEN, REAL_ESTATE_CHAT_ID)
+            if mnv_key:
+                seen_urls.add(mnv_key)
+        else:
+            logger.error("Kihagyva! Hiányzó REAL_ESTATE_BOT_TOKEN vagy REAL_ESTATE_CHAT_ID")
 
     save_seen_urls(seen_urls)
     logger.info("=== SCRAPER SIKERESEN LEFUTOTT ===")
