@@ -26,7 +26,7 @@ CHAT_ID = os.environ.get("CHAT_ID")
 REAL_ESTATE_BOT_TOKEN = os.environ.get("REAL_ESTATE_BOT_TOKEN")
 REAL_ESTATE_CHAT_ID = os.environ.get("REAL_ESTATE_CHAT_ID")
 
-# Budapest XVII. ker. Sáránd utca koordinátái a távolságszámításhoz
+# Távolságszámítási kiindulópont koordinátái
 ORIGIN_LAT = 47.4344
 ORIGIN_LON = 19.2198
 
@@ -68,7 +68,8 @@ def clean_text(text):
 def escape_html(text):
     if not text:
         return ""
-    return str(text).replace("&", "&").replace("<", "<").replace(">", ">")
+    # Szigorúbb csere, hogy a Telegram parser semmiképp se akadjon meg rajta
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def extract_nav_eaf_links(html_content):
@@ -195,9 +196,8 @@ def parse_nav_eaf_details(url):
 
     data["image_url"] = scrape_main_image(url, soup)
 
-    # Csak akkor geokódolunk és számolunk távolságot, ha van megtekintési hely megadva
     megtekintes_hely = data.get("megtekintes_hely", "")
-    if megtekintes_hely:
+    if megtekintes_hely and "ingatlan" not in megtekintes_hely.lower():
         coords = geocode_address(megtekintes_hely)
         if coords:
             lat, lon = coords
@@ -277,12 +277,10 @@ def get_emails_since(since_date):
 # =================== Üzenetküldés Dinamikus Bot Választással ===================
 
 def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
-    """Közvetlen API hívás a dinamikusan átadott bot credentials-ökkel."""
     if not target_bot_token or not target_chat_id:
         logger.error("Hiba: Hiányzó Telegram token vagy chat ID!")
         return
 
-    # 1. Kép letöltése és küldése bájtként
     if image_url:
         try:
             img_resp = requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
@@ -299,7 +297,6 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
         except Exception as e:
             logger.warning(f"Nem sikerült a képet küldeni, megpróbáljuk sima szövegként: {e}")
 
-    # 2. Sima szöveges küldés (pót-megoldásként vagy ha nincs kép)
     try:
         url = f"https://api.telegram.org/bot{target_bot_token}/sendMessage"
         data = {'chat_id': target_chat_id, 'text': caption, 'parse_mode': 'HTML', 'disable_web_page_preview': False}
@@ -313,52 +310,64 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
 
 
 def send_auction_message(a: dict, target_bot_token, target_chat_id, is_real_estate: bool):
-    # Fejléc beállítása kategóriától függően
-    if is_real_estate:
-        lines = ["🆕 <b>NAV INGATLAN TALÁLAT</b>", ""]
-    else:
-        lines = ["🆕 <b>NAV INGÓSÁG TALÁLAT</b>", ""]
+    # 1. Először levágjuk a nyers, hosszú szövegeket, hogy véletlenül se sérüljön a HTML struktúra
+    leiras_nyers = a.get("egyeb_info", "")
+    if len(leiras_nyers) > 400:
+        leiras_nyers = leiras_nyers[:400] + "…"
+
+    # 2. Csak most futtatjuk le az escape_html-t a tiszta adatokra
+    cim = escape_html(a.get('cim', 'N/A'))
+    megye = escape_html(a.get("megye", ""))
+    tavolsag = escape_html(a.get("tavolsag", ""))
+    allapot = escape_html(a.get('allapot', 'N/A'))
+    darabszam = escape_html(a.get('darabszam', ''))
+    becsertek = escape_html(a.get('becsertek', 'N/A'))
+    minimal_ajanlat = escape_html(a.get('minimal_ajanlat', 'N/A'))
+    kezdet = escape_html(a.get('kezdet', 'N/A'))
+    befejezes = escape_html(a.get('befejezes', 'N/A'))
+    ugyszam = escape_html(a.get('ugyintezesi_szam', ''))
+    leiras = escape_html(leiras_nyers)
+
+    # 3. Összeállítjuk a fix, biztonságos HTML üzenetet
+    fejlec = "🆕 <b>NAV INGATLAN TALÁLAT</b>" if is_real_estate else "🆕 <b>NAV INGÓSÁG TALÁLAT</b>"
     
-    lines.append("🌍 <b>1. Elhelyezkedés és Alapadatok</b>")
-    lines.append(f"📍 <b>Megnevezés/Cím:</b> {escape_html(a.get('cim', 'N/A'))}")
+    lines = [
+        fejlec, "",
+        "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
+        f"📍 <b>Megnevezés/Cím:</b> {cim}"
+    ]
     
-    megye_str = escape_html(a.get("megye", ""))
-    if megye_str: lines.append(f"🏛 <b>Megye:</b> {megye_str}")
-        
-    dist_str = escape_html(a.get("tavolsag", ""))
-    if dist_str and dist_str != "N/A": lines.append(f"🗺 <b>Budapest-távolság:</b> {dist_str}")
-    lines.append("")
+    if megye: lines.append(f"🏛 <b>Megye:</b> {megye}")
+    if tavolsag and tavolsag != "N/A": lines.append(f"🗺 <b>Budapest-távolság:</b> {tavolsag}")
     
-    lines.append("🏠 <b>2. Jellemzők</b>")
-    lines.append(f"🚪 <b>Állapot / Leírás:</b> {escape_html(a.get('allapot', 'N/A'))}")
-    if a.get("darabszam"): lines.append(f"🔢 <b>Darabszám:</b> {escape_html(a['darabszam'])}")
-    lines.append("")
+    lines.extend([
+        "",
+        "🏠 <b>2. Jellemzők</b>",
+        f"🚪 <b>Állapot / Leírás:</b> {allapot}"
+    ])
+    if darabszam: lines.append(f"🔢 <b>Darabszám:</b> {darabszam}")
     
-    lines.append("💰 <b>3. Pénzügyi Információk</b>")
-    lines.append(f"💵 <b>Becsérték (Jelenlegi ár):</b> {escape_html(a.get('becsertek', 'N/A'))}")
-    lines.append(f"📉 <b>Minimál ajánlat:</b> {escape_html(a.get('minimal_ajanlat', 'N/A'))}")
-    lines.append("")
+    lines.extend([
+        "",
+        "💰 <b>3. Pénzügyi Információk</b>",
+        f"💵 <b>Becsérték (Jelenlegi ár):</b> {becsertek}",
+        f"📉 <b>Minimál ajánlat:</b> {minimal_ajanlat}",
+        "",
+        "⚖️ <b>4. Jogi és Árverési Státusz</b>",
+        f"▶️ <b>Árverés kezdete:</b> {kezdet}",
+        f"📅 <b>Árverés vége:</b> {befejezes}"
+    ])
+    if ugyszam: lines.append(f"📄 <b>Ügyszám:</b> {ugyszam}")
     
-    lines.append("⚖️ <b>4. Jogi és Árverési Státusz</b>")
-    lines.append(f"▶️ <b>Árverés kezdete:</b> {escape_html(a.get('kezdet', 'N/A'))}")
-    lines.append(f"📅 <b>Árverés vége:</b> {escape_html(a.get('befejezes', 'N/A'))}")
-    if a.get("ugyintezesi_szam"): lines.append(f"📄 <b>Ügyszám:</b> {escape_html(a['ugyintezesi_szam'])}")
-    lines.append("")
-    
-    leiras = a.get("egyeb_info", "")
     if leiras:
-        lines.append(f"📝 <b>Részletes leírás:</b>\n<i>{escape_html(leiras[:400])}</i>")
-        lines.append("")
+        lines.extend(["", f"📝 <b>Részletes leírás:</b>", f"<i>{leiras}</i>"])
         
-    lines.append(f"🔗 <a href='{a.get('url', '')}'>Részletek a NAV oldalon</a>")
+    lines.extend(["", f"🔗 <a href='{a.get('url', '')}'>Részletek a NAV oldalon</a>"])
     
     maps_url = a.get("maps_url", "")
     if maps_url: lines.append(f"🗺 <a href='{maps_url}'>Google Térkép</a>")
 
     caption = "\n".join(lines)
-    if len(caption) > 1024:
-        caption = caption[:1020] + "…"
-
     send_via_requests(caption, a.get("image_url"), target_bot_token, target_chat_id)
 
 
@@ -385,12 +394,10 @@ def main():
             else:
                 logger.info(f"Már feldolgozott link kihagyása: {link}")
 
-    # Futáson belüli egyediesítés URL alapján
     unique_auctions = list({a["url"]: a for a in all_auctions}.values())
     logger.info(f"Összes új feldolgozandó tétel száma: {len(unique_auctions)}")
     
     for a in unique_auctions:
-        # Intelligens kategória felismerés (ingatlan vs ingóság)
         kategoria_szoveg = (a.get("kategoria", "") + " " + a.get("kategoria_reszletes", "")).lower()
         is_real_estate = "ingatlan" in kategoria_szoveg
         
@@ -403,7 +410,6 @@ def main():
             chat_id = CHAT_ID
             logger.info(f"-> [INGÓSÁG ROUTING] Küldés az Ingóság Botnak: {a.get('cim')}")
             
-        # Küldés végrehajtása
         if token and chat_id:
             send_auction_message(a, token, chat_id, is_real_estate=is_real_estate)
             seen_urls.add(a["url"])
