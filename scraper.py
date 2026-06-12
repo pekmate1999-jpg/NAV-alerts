@@ -338,7 +338,7 @@ def send_auction_message(a: dict, target_bot_token, target_chat_id, is_real_esta
     if not teljes_cim or teljes_cim == ",":
         teljes_cim = a.get('megtekintes_hely', 'Ismeretlen helyszín')
 
-    # A "Cím" mezőbe most a tétel neve kerül
+    # A tétel megnevezése
     tetel_nev = escape_html(a.get('cim', 'Ismeretlen tétel'))
 
     megye = escape_html(a.get("megye", ""))
@@ -351,7 +351,8 @@ def send_auction_message(a: dict, target_bot_token, target_chat_id, is_real_esta
     lines = [
         fejlec, "",
         "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
-        f"📍 <b>Tétel:</b> {tetel_nev}"
+        f"🏷️ <b>Tétel:</b> {tetel_nev}",
+        f"📍 <b>Helyszín:</b> {escape_html(teljes_cim)}"
     ]
     
     if megye: lines.append(f"🏛 <b>Megye:</b> {megye}")
@@ -373,8 +374,7 @@ def send_auction_message(a: dict, target_bot_token, target_chat_id, is_real_esta
         "",
         "📅 <b>4. Időpontok és Árverési Státusz</b>",
         f"▶️ <b>Kezdés:</b> {kezdet}",
-        f"⬜ <b>Befejezés:</b> {befejezes}",
-        f"📍 <b>Helyszín:</b> {escape_html(teljes_cim)}"
+        f"⬜ <b>Befejezés:</b> {befejezes}"
     ])
     
     if a.get("megtekintes_ido"):
@@ -390,7 +390,6 @@ def send_auction_message(a: dict, target_bot_token, target_chat_id, is_real_esta
 
     caption = "\n".join(lines)
     send_via_requests(caption, a.get("image_url"), target_bot_token, target_chat_id)
-
 
 # =================== Fő logika ===================
 
