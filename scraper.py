@@ -315,91 +315,78 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
 
 
 def send_auction_message(a: dict, target_bot_token, target_chat_id, is_real_estate: bool):
-    # 1. Nyers leírások levágása a biztonságos HTML kezelés érdekében
+    # 1. Előkészítés
     leiras_nyers = a.get("egyeb_info", "")
     if len(leiras_nyers) > 400:
         leiras_nyers = leiras_nyers[:400] + "…"
 
-    # Biztonsági HTML escape a változókra
     leiras = escape_html(leiras_nyers)
     becsertek = escape_html(a.get('becsertek', '0 HUF'))
     minimal_ajanlat = escape_html(a.get('minimal_ajanlat', '0 HUF'))
     kezdet = escape_html(a.get('kezdet', 'N/A'))
     befejezes = escape_html(a.get('befejezes', 'N/A'))
     darabszam = escape_html(a.get('darabszam', ''))
+    
+    # Árverés neve a fejlécbe
+    arveres_nev = escape_html(a.get('kategoria_reszletes', a.get('kategoria', 'Árverés')))
 
-    # 2. Cím és elhelyezkedés precíz felépítése a PDF struktúra alapján
+    # Cím és helyszín kezelése
     varos_resz = a.get('Cím irányítószám, város', a.get('város', '')).strip()
     utca_resz = a.get('Cím utca', a.get('utca', '')).strip()
     hazszam_resz = a.get('Házszám, emelet, ajtó', a.get('házszám', '')).strip()
-    
     teljes_cim = f"{varos_resz}, {utca_resz} {hazszam_resz}".strip(", ").replace("  ", " ")
     if not teljes_cim or teljes_cim == ",":
-        teljes_cim = a.get('cim', 'Ismeretlen helyszín')
+        teljes_cim = a.get('megtekintes_hely', 'Ismeretlen helyszín')
+
+    # A "Cím" mezőbe most a tétel neve kerül
+    tetel_nev = escape_html(a.get('cim', 'Ismeretlen tétel'))
 
     megye = escape_html(a.get("megye", ""))
     tavolsag = a.get("tavolsag", "")
-    
-    # Ha a megtekintés helye "ingatlan címén", cseréljük le a szép, teljes címre
-    helyszin_szoveg = a.get("megtekintes_hely", "")
-    if not helyszin_szoveg or "ingatlan címén" in helyszin_szoveg.lower():
-        helyszin_szoveg = teljes_cim
-    helyszin_szoveg = escape_html(helyszin_szoveg)
+    allapot = escape_html(a.get('allapot', a.get('kategoria_reszletes', 'Egyéb')))
 
-    # 3. Állapot / Kategória kezelése (N/A szűrése)
-    allapot_nyers = a.get('allapot', '').strip()
-    if not allapot_nyers or allapot_nyers.upper() == "N/A":
-        allapot_nyers = a.get('kategoria_reszletes', a.get('kategoria', 'Egyéb tétel'))
-    allapot = escape_html(allapot_nyers)
-
-    # 4. Üzenet felépítése a screenshot stílusában (Ügyszám nélkül)
-    fejlec = "🔔 <b>NAV INGATLAN TALÁLAT – ÚJ LICIT</b>" if is_real_estate else "🔔 <b>NAV INGÓSÁG TALÁLAT – ÚJ LICIT</b>"
+    # 2. Üzenet felépítése
+    fejlec = f"🔔 <b>{arveres_nev}</b>"
     
     lines = [
         fejlec, "",
         "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
-        f"📍 <b>Cím:</b> {teljes_cim}"
+        f"📍 <b>Tétel:</b> {tetel_nev}"
     ]
     
-    if megye: 
-        lines.append(f"🏛 <b>Megye:</b> {megye}")
-        
+    if megye: lines.append(f"🏛 <b>Megye:</b> {megye}")
     if tavolsag and "Nem sikerült" not in tavolsag and tavolsag != "N/A": 
         lines.append(f"🗺 <b>Budapest-távolság:</b> {tavolsag}")
     
     lines.extend([
         "",
-        "🏠 <b>2. Az Ingatlan és a Telek Jellemzői</b>" if is_real_estate else "📦 <b>2. A Tétel Jellemzői</b>",
-        f"🚪 <b>Kategória / Állapot:</b> {allapot}"
+        "🏠 <b>2. A Tétel Jellemzői</b>",
+        f"🚪 <b>Állapot:</b> {allapot}"
     ])
-    if darabszam: 
-        lines.append(f"🔢 <b>Darabszám:</b> {darabszam}")
+    if darabszam: lines.append(f"🔢 <b>Darabszám:</b> {darabszam}")
     
     lines.extend([
         "",
         "💰 <b>3. Pénzügyi Információk</b>",
-        f"💵 <b>Becsérték (Jelenlegi ár):</b> {becsertek}",
+        f"💵 <b>Becsérték:</b> {becsertek}",
         f"📉 <b>Minimál ajánlat:</b> {minimal_ajanlat}",
         "",
         "📅 <b>4. Időpontok és Árverési Státusz</b>",
         f"▶️ <b>Kezdés:</b> {kezdet}",
-        f"⬜ <b>Befejezés:</b> {befejezes}"
+        f"⬜ <b>Befejezés:</b> {befejezes}",
+        f"📍 <b>Helyszín:</b> {escape_html(teljes_cim)}"
     ])
     
-    # Megtekintési infók integrálása a 4-es blokk alá, ahogy a mintán szerepel
-    if a.get("megtekintes_hely"):
-        lines.append(f"📍 <b>Helyszín:</b> {helyszin_szoveg}")
     if a.get("megtekintes_ido"):
-        lines.append(f"🕒 <b>Időpont:</b> {escape_html(a.get('megtekintes_ido'))}")
+        lines.append(f"🕒 <b>Megtekintés:</b> {escape_html(a.get('megtekintes_ido'))}")
     
     if leiras:
         lines.extend(["", f"📝 <b>Leírás:</b>", f"<i>{leiras}</i>"])
         
     lines.extend(["", f"🔗 <a href='{a.get('url', '')}'>Részletek a NAV oldalon</a>"])
     
-    maps_url = a.get("maps_url", "")
-    if maps_url: 
-        lines.append(f"🗺 <a href='{maps_url}'>Google Térkép</a>")
+    if a.get("maps_url"): 
+        lines.append(f"🗺 <a href='{a.get('maps_url')}'>Google Térkép</a>")
 
     caption = "\n".join(lines)
     send_via_requests(caption, a.get("image_url"), target_bot_token, target_chat_id)
