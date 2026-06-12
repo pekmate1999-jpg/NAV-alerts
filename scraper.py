@@ -9,7 +9,7 @@ from telegram import Bot
 from datetime import datetime, timezone, timedelta
 import logging
 import io
-import asyncio  # MÓDOSÍTÁS: Szükséges az aszinkron futtatáshoz
+import asyncio  # Szükséges az aszinkron futáshoz
 
 # ------------------- Konfiguráció -------------------
 EMAIL = os.environ.get("EMAIL_ADDRESS")
@@ -17,10 +17,12 @@ PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
+# Budapest XVII. ker. Sáránd utca közelítő koordinátái (kiindulópont a távolsághoz)
 ORIGIN_LAT = 47.4344
 ORIGIN_LON = 19.2198
 ORIGIN_LABEL = "Budapest XVII. ker. Sáránd utca"
 
+# ------------------- Látott URL-ek tárolója -------------------
 SEEN_URLS_FILE = os.path.join(os.path.dirname(__file__), "seen_urls.json")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -92,21 +94,25 @@ def simplify_address(address):
     import re
     candidates = []
     candidates.append(address)
+
     cleaned = re.sub(r",?\s*\d+(/\d+)?\s*hrsz\.?", "", address, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(külterület|belterület|tanya)\b", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip().rstrip(",").strip()
     if cleaned and cleaned != address:
         candidates.append(cleaned)
+
     city_match = re.match(r"(\d{4}\s+[A-Za-záéíóöőúüűÁÉÍÓÖŐÚÜŰ][A-Za-záéíóöőúüűÁÉÍÓÖŐÚÜŰ\s\-]+?)(?:\s*,|\s+\d|\s+külterület|\s+belterület|$)", cleaned or address)
     if city_match:
         city_only = city_match.group(1).strip()
         if city_only not in candidates:
             candidates.append(city_only)
+
     zip_match = re.match(r"(\d{4})", address)
     if zip_match:
         zip_candidate = zip_match.group(1) + ", Magyarország"
         if zip_candidate not in candidates:
             candidates.append(zip_candidate)
+
     seen = []
     for c in candidates:
         c = c.strip()
@@ -119,6 +125,7 @@ def geocode_address(address):
     import time
     candidates = simplify_address(address)
     headers = {"User-Agent": "NAV-EAF-Scraper/1.0"}
+
     for candidate in candidates:
         try:
             params = {"q": candidate, "format": "json", "limit": 1, "countrycodes": "hu"}
@@ -136,6 +143,7 @@ def geocode_address(address):
         except Exception as e:
             logger.error(f"Geocode hiba ('{candidate}'): {e}")
             time.sleep(1.1)
+
     logger.warning(f"Geocode: minden próba sikertelen: '{address}'")
     return None
 
@@ -145,6 +153,7 @@ def get_drive_distance(dest_address):
     if not coords:
         return None
     dest_lat, dest_lon = coords
+
     try:
         url = f"http://router.project-osrm.org/route/v1/driving/{ORIGIN_LON},{ORIGIN_LAT};{dest_lon},{dest_lat}?overview=false"
         resp = requests.get(url, timeout=15)
@@ -154,7 +163,7 @@ def get_drive_distance(dest_address):
             route = data["routes"][0]
             km = round(route["distance"] / 1000, 1)
             minutes = round(route["duration"] / 60)
-            return f"{km} km ({minutes} perc autóval)"
+            return km, minutes
         else:
             logger.warning(f"OSRM: nem sikerült útvonalat számítani: {data.get('code')}")
             return None
@@ -264,7 +273,7 @@ def parse_nav_eaf_details(url, html_text=None):
             if len(cells) >= 2:
                 key = clean_text(cells[0].get_text())
                 value = clean_text(cells[1].get_text())
-                if "Tétel megnevezése" in key or "Ingatlan megnevezése" in key:
+                if "Tétel megnevezése" in key:
                     data["tetel_megnevezes"] = value
                 elif "Becsérték" in key:
                     data["becsertek"] = value
@@ -276,38 +285,19 @@ def parse_nav_eaf_details(url, html_text=None):
                     data["allapot"] = value
                 elif "Egyéb infó" in key:
                     data["egyeb_info"] = value
-                elif "Cím irányítószám, város" in key:
-                    data["ingatlan_varos"] = value
-                elif "Cím utca" in key:
-                    data["ingatlan_utca"] = value
-                elif "Házszám, emelet, ajtó" in key:
-                    data["ingatlan_hazszam"] = value
-                elif "Tulajdoni hányad" in key:
-                    data["tulajdoni_hanyad"] = value
-                elif "Helyrajzi szám" in key:
-                    data["hrsz"] = value
-                elif "Terület" in key:
-                    data["terulet"] = value
 
     data["image_url"] = scrape_main_image(url, soup)
 
-    varos = data.get("ingatlan_varos", "")
-    utca = data.get("ingatlan_utca", "")
-    hazszam = data.get("ingatlan_hazszam", "")
-    ingatlan_cim = ", ".join(filter(None, [varos, utca, hazszam]))
-    if ingatlan_cim:
-        data["pontos_cim"] = ingatlan_cim
-
     megtekintes_hely = data.get("megtekintes_hely", "")
-    geocoding_target = megtekintes_hely
-    if megtekintes_hely and "ingatlan cím" in megtekintes_hely.lower() and ingatlan_cim:
-        geocoding_target = ingatlan_cim
-
-    if geocoding_target and geocoding_target.strip().upper() != "N/A":
-        distance_result = get_drive_distance(geocoding_target)
-        data["tavolsag"] = distance_result if distance_result else None
+    if megtekintes_hely:
+        result = get_drive_distance(megtekintes_hely)
+        if result:
+            km, minutes = result
+            data["tavolsag"] = f"{km} km ({minutes} perc autóval)"
+        else:
+            data["tavolsag"] = "Nem sikerült kiszámítani"
     else:
-        data["tavolsag"] = None
+        data["tavolsag"] = "N/A"
 
     if "tetel_megnevezes" in data:
         data["cim"] = data["tetel_megnevezes"]
@@ -357,6 +347,7 @@ def get_emails_since(since_date):
         mail.login(EMAIL, PASSWORD)
         mail.select("inbox")
 
+        # JAVÍTÁS: Csak az olvasatlan leveleket keresi (UNSEEN)
         search_criteria = f'(UNSEEN SINCE "{since_date.strftime("%d-%b-%Y")}")'
         status, messages = mail.search(None, search_criteria)
         if status != "OK" or not messages[0]:
@@ -393,6 +384,7 @@ def get_emails_since(since_date):
             if html_body:
                 result.append(html_body)
 
+            # Olvasottá tétel feldolgozás után
             mail.store(eid, "+FLAGS", "\\Seen")
 
         mail.close()
@@ -403,59 +395,35 @@ def get_emails_since(since_date):
         return []
 
 
-# =================== MÓDOSÍTÁS: ASZINKRON TELEGRAM KÜLDÉS ===================
-
-async def send_group_header(category: str, count: int):
-    text = (
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📂 <b>{category}</b>  •  {count} tétel\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━"
-    )
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="HTML", disable_web_page_preview=True)
-    except Exception as e:
-        logger.error(f"Fejléc küldési hiba: {e}")
-
+# =================== JAVÍTÁS: ASZINKRON TELEGRAM KÜLDÉS ===================
 
 async def send_auction_message(idx: int, a: dict):
     caption = f"🏛️ <b>{a.get('cim', 'Cím nélkül')}</b>\n\n"
 
-    def add_field(label, value):
-        if value and str(value).strip().upper() != "N/A" and str(value).strip() != "":
-            return f"{label} {value}\n"
-        return ""
+    caption += "📦 <b>1. Tétel alapadatok</b>\n"
+    caption += f"🏷️ Kategória: {a.get('kategoria_reszletes', 'N/A')}\n"
+    caption += f"📊 Állapot: {a.get('allapot', 'N/A')}\n"
+    if a.get("darabszam"):
+        caption += f"🔢 Darabszám: {a.get('darabszam')}\n"
+    caption += "\n"
 
-    section1 = ""
-    section1 += add_field("🏷️ Kategória:", a.get("kategoria_reszletes"))
-    section1 += add_field("📊 Állapot:", a.get("allapot"))
-    section1 += add_field("🔢 Darabszám:", a.get("darabszam"))
-    section1 += add_field("📐 Terület:", a.get("terulet"))
-    section1 += add_field("👤 Tulajdoni hányad:", a.get("tulajdoni_hanyad"))
-    section1 += add_field("📝 Hrsz:", a.get("hrsz"))
-    if section1:
-        caption += "📦 <b>1. Tétel alapadatok</b>\n" + section1 + "\n"
+    caption += "💰 <b>2. Pénzügyi információk</b>\n"
+    caption += f"💵 Becsérték: {a.get('becsertek', 'N/A')}\n"
+    caption += f"💸 Minimál ajánlat: {a.get('minimal_ajanlat', 'N/A')}\n"
+    caption += "\n"
 
-    section2 = ""
-    section2 += add_field("💵 Becsérték:", a.get("becsertek"))
-    section2 += add_field("💸 Minimál ajánlat:", a.get("minimal_ajanlat"))
-    if section2:
-        caption += "💰 <b>2. Pénzügyi információk</b>\n" + section2 + "\n"
+    caption += "📅 <b>3. Időpontok</b>\n"
+    caption += f"▶️ Kezdés: {a.get('kezdet', 'N/A')}\n"
+    caption += f"⏹️ Befejezés: {a.get('befejezes', 'N/A')}\n"
+    caption += "\n"
 
-    section3 = ""
-    section3 += add_field("▶️ Kezdés:", a.get("kezdet"))
-    section3 += add_field("⏹️ Befejezés:", a.get("befejezes"))
-    if section3:
-        caption += "📅 <b>3. Időpontok</b>\n" + section3 + "\n"
+    caption += "📍 <b>4. Megtekintés</b>\n"
+    caption += f"🗺️ Helyszín: {a.get('megtekintes_hely', 'N/A')}\n"
+    caption += f"🕐 Időpont: {a.get('megtekintes_ido', 'N/A')}\n"
+    caption += f"🚗 Távolság: {a.get('tavolsag', 'N/A')}\n"
+    caption += "\n"
 
-    section4 = ""
-    section4 += add_field("📍 Pontos cím:", a.get("pontos_cim"))
-    section4 += add_field("🗺️ Helyszín:", a.get("megtekintes_hely"))
-    section4 += add_field("🕐 Időpont:", a.get("megtekintes_ido"))
-    section4 += add_field("🚗 Távolság:", a.get("tavolsag"))
-    if section4:
-        caption += "📍 <b>4. Megtekintés</b>\n" + section4 + "\n"
-
-    if a.get("egyeb_info") and a["egyeb_info"].strip().upper() != "N/A" and a["egyeb_info"].strip() != "":
+    if a.get("egyeb_info"):
         caption += "📝 <b>5. Leírás</b>\n"
         caption += f"<i>{a['egyeb_info'][:250]}</i>\n\n"
 
@@ -501,11 +469,10 @@ async def send_telegram_messages(auctions: list):
 
     groups = group_auctions_by_category(auctions)
     total = sum(len(v) for v in groups.values())
-    cat_count = len(groups)
 
     summary = (
         f"🔔 <b>Új NAV EAF árverések</b>\n"
-        f"📊 Összesen: <b>{total} új tétel</b> / <b>{cat_count} kategória</b>\n"
+        f"📊 Összesen: <b>{total} új tétel</b>\n"
         f"🕐 {datetime.now().strftime('%Y.%m.%d %H:%M')}"
     )
     try:
@@ -513,8 +480,8 @@ async def send_telegram_messages(auctions: list):
     except Exception as e:
         logger.error(f"Összefoglaló fejléc küldési hiba: {e}")
 
+    # MÓDOSÍTÁS: Kivettük a send_group_header hívásokat, így tisztán csak a tételek mennek ki
     for category, items in groups.items():
-        await send_group_header(category, len(items))
         for idx, a in enumerate(items, 1):
             await send_auction_message(idx, a)
 
@@ -523,12 +490,11 @@ async def send_telegram_messages(auctions: list):
 
 def main():
     since = datetime.now(timezone.utc) - timedelta(days=1)
-    logger.info(f"=== NAV EAF Scraper v1.01 indítás ===")
+    logger.info(f"=== NAV EAF Scraper v1.02 indítás ===")
 
     seen_urls = load_seen_urls()
     emails_html = get_emails_since(since)
     if not emails_html:
-        # Itt is meg kell hívni aszinkronként, ha üres
         asyncio.run(send_telegram_messages([]))
         return
 
@@ -543,7 +509,6 @@ def main():
     unique = list({a["url"]: a for a in all_auctions}.values())
     new_auctions = filter_new_auctions(unique, seen_urls)
 
-    # MÓDOSÍTÁS: A küldő függvényt az asyncio.run segítségével hívjuk meg
     asyncio.run(send_telegram_messages(new_auctions))
 
     for a in new_auctions:
