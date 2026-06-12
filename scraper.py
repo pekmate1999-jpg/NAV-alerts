@@ -20,18 +20,15 @@ CHAT_ID = os.environ.get("CHAT_ID")
 REAL_ESTATE_BOT_TOKEN = os.environ.get("REAL_ESTATE_BOT_TOKEN")
 REAL_ESTATE_CHAT_ID = os.environ.get("REAL_ESTATE_CHAT_ID")
 
-# Budapest XVII. ker. Sáránd utca közelítő koordinátái (kiindulópont a távolsághoz)
+# Budapest XVII. ker. Sáránd utca közelítő koordinátái (távolsághoz)
 ORIGIN_LAT = 47.4344
 ORIGIN_LON = 19.2198
-ORIGIN_LABEL = "Budapest XVII. ker. Sáránd utca"
 
-# ------------------- Látott URL-ek tárolója -------------------
 SEEN_URLS_FILE = os.path.join(os.path.dirname(__file__), "seen_urls.json")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Botok inicializálása (fő bot mindig létezik, ingatlan bot opcionális)
 bot = Bot(token=BOT_TOKEN)
 real_estate_bot = Bot(token=REAL_ESTATE_BOT_TOKEN) if REAL_ESTATE_BOT_TOKEN and REAL_ESTATE_CHAT_ID else None
 
@@ -39,7 +36,6 @@ real_estate_bot = Bot(token=REAL_ESTATE_BOT_TOKEN) if REAL_ESTATE_BOT_TOKEN and 
 # =================== Látott URL-ek kezelése ===================
 
 def load_seen_urls() -> set:
-    """Betölti a már látott (kiküldött) URL-ek halmazát a JSON fájlból."""
     if not os.path.exists(SEEN_URLS_FILE):
         return set()
     try:
@@ -52,29 +48,24 @@ def load_seen_urls() -> set:
 
 
 def save_seen_urls(seen: set):
-    """Elmenti a látott URL-ek halmazát a JSON fájlba."""
     try:
         with open(SEEN_URLS_FILE, "w", encoding="utf-8") as f:
             json.dump({"seen_urls": sorted(seen)}, f, ensure_ascii=False, indent=2)
-        logger.info(f"Látott URL-ek mentve: {len(seen)} db → {SEEN_URLS_FILE}")
+        logger.info(f"Látott URL-ek mentve: {len(seen)} db")
     except Exception as e:
         logger.error(f"Látott URL-ek mentési hiba: {e}")
 
 
 def filter_new_auctions(auctions: list, seen: set) -> list:
-    """Csak azokat az árveréseket adja vissza, amelyek URL-je még nem szerepel a seen halmazban."""
     new = [a for a in auctions if a.get("url") and a["url"] not in seen]
-    logger.info(f"Szűrés: {len(auctions)} árverésből {len(new)} új (még nem küldött).")
+    logger.info(f"Szűrés: {len(auctions)} árverésből {len(new)} új.")
     return new
 
 
-# =================== Csoportosítás azonos név szerint ===================
+# =================== Csoportosítás ===================
 
 def group_by_name(auctions: list) -> dict:
-    """
-    Csoportosítja az árveréseket a 'cim' mező alapján.
-    Visszaad egy dict-et: {cím: [árverés, ...]}
-    """
+    """Csoportosítja az árveréseket a 'cim' mező alapján."""
     groups = {}
     for a in auctions:
         name = a.get("cim", "Ismeretlen tétel")
@@ -83,26 +74,21 @@ def group_by_name(auctions: list) -> dict:
 
 
 def is_real_estate(auction: dict) -> bool:
-    """
-    Eldönti, hogy egy árverési tétel ingatlan-e.
-    A kategória mezőkben keresünk 'ingatlan' szót (nem kis/nagybetű érzékeny).
-    """
+    """Igaz, ha a kategória tartalmazza az 'ingatlan' szót."""
     kategoria = auction.get("kategoria_reszletes", "") or auction.get("kategoria", "")
     return "ingatlan" in kategoria.lower()
 
 
 def build_combined_message(group_name: str, items: list) -> str:
     """
-    Összeállít egyetlen Telegram üzenetet egy név alá tartozó összes tételből.
+    Összeállít egy üzenetet egy csoportba tartozó összes tételből.
     Az első tétel adatait használja a közös leíráshoz (kategória nélkül),
     majd a végén felsorolja az összes linket.
     """
     first = items[0]
-
-    # Cím (a csoport neve)
     caption = f"🏛️ <b>{group_name}</b>\n\n"
 
-    # 1. Alapadatok (kategória kihagyva)
+    # 1. Alapadatok (kategória nélkül)
     caption += "📦 <b>1. Tétel alapadatok</b>\n"
     if first.get("allapot"):
         caption += f"📊 Állapot: {first.get('allapot')}\n"
@@ -129,12 +115,12 @@ def build_combined_message(group_name: str, items: list) -> str:
     caption += f"🚗 Távolság: {first.get('tavolsag', 'N/A')}\n"
     caption += "\n"
 
-    # 5. Leírás (ha van)
+    # 5. Leírás
     if first.get("egyeb_info"):
         caption += "📝 <b>5. Leírás</b>\n"
         caption += f"<i>{first['egyeb_info'][:250]}</i>\n\n"
 
-    # Linkek felsorolása – minden tételhez külön
+    # Linkek felsorolása
     if len(items) == 1:
         caption += f"🔗 <a href='{items[0]['url']}'>Részletek megtekintése</a>"
     else:
@@ -142,44 +128,96 @@ def build_combined_message(group_name: str, items: list) -> str:
         for idx, item in enumerate(items, 1):
             caption += f"{idx}. <a href='{item['url']}'>Tétel linkje</a>\n"
 
-    # Telegram limit 1024 karakter – ha túllépné, levágjuk
     if len(caption) > 1024:
         caption = caption[:1020] + "…"
     return caption
 
 
-def send_grouped_messages(groups: dict, target_bot: Bot, target_chat_id: str):
+def download_image(image_url: str) -> bytes | None:
+    """Letölti a képet az URL-ről, visszaadja a bájtokat vagy None-t."""
+    if not image_url:
+        return None
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        resp = requests.get(image_url, timeout=20, headers=headers)
+        resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "")
+        if "image" not in content_type:
+            logger.warning(f"Nem kép tartalom ({content_type})")
+            return None
+        return resp.content
+    except Exception as e:
+        logger.error(f"Kép letöltési hiba: {image_url} - {e}")
+        return None
+
+
+def send_grouped_messages(groups: dict, target_bot: Bot, target_chat_id: str, category_label: str):
     """
-    Elküldi a csoportosított tételeket a megadott boton keresztül.
-    Minden csoporthoz egyetlen üzenet (szöveg, kép nélkül).
+    Összevont csoportok küldése. Minden csoporthoz az első tétel képét próbáljuk elküldeni.
+    category_label: pl. "ingatlanok" vagy "ingóságok" a fejlécbe.
     """
     if not groups:
         return
     total_items = sum(len(v) for v in groups.values())
     total_groups = len(groups)
 
-    # Összefoglaló fejléc
     summary = (
-        f"🔔 <b>Új NAV EAF árverések</b>\n"
+        f"🔔 <b>Új NAV EAF árverések ({category_label})</b>\n"
         f"📊 Összesen: <b>{total_items} új tétel</b> / <b>{total_groups} csoport</b>\n"
         f"🕐 {datetime.now().strftime('%Y.%m.%d %H:%M')}"
     )
     try:
         target_bot.send_message(chat_id=target_chat_id, text=summary, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
-        logger.error(f"Összefoglaló fejléc küldési hiba: {e}")
+        logger.error(f"Összefoglaló fejléc hiba ({category_label}): {e}")
 
-    # Csoportonkénti küldés
     for group_name, items in groups.items():
         caption = build_combined_message(group_name, items)
-        try:
-            target_bot.send_message(chat_id=target_chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=False)
-            logger.info(f"Csoport elküldve: {group_name} ({len(items)} tétel)")
-        except Exception as e:
-            logger.error(f"Hiba a csoport küldésekor ({group_name}): {e}")
+        first_item = items[0]
+        image_url = first_item.get("image_url")
+        image_bytes = download_image(image_url) if image_url else None
+
+        sent = False
+        if image_bytes:
+            try:
+                target_bot.send_photo(
+                    chat_id=target_chat_id,
+                    photo=io.BytesIO(image_bytes),
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+                sent = True
+                logger.info(f"Csoport kész: {group_name} ({len(items)} tétel) - képpel")
+            except Exception as e:
+                logger.warning(f"Képküldés sikertelen a csoporthoz ({group_name}): {e}")
+
+        if not sent and image_url:
+            try:
+                target_bot.send_photo(
+                    chat_id=target_chat_id,
+                    photo=image_url,
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+                sent = True
+                logger.info(f"Csoport kész: {group_name} ({len(items)} tétel) - URL képpel")
+            except Exception as e:
+                logger.warning(f"Képküldés URL-ről sikertelen ({group_name}): {e}")
+
+        if not sent:
+            try:
+                target_bot.send_message(
+                    chat_id=target_chat_id,
+                    text=caption,
+                    parse_mode="HTML",
+                    disable_web_page_preview=False
+                )
+                logger.info(f"Csoport kész: {group_name} ({len(items)} tétel) - szövegesen")
+            except Exception as e:
+                logger.error(f"Szöveges küldés is sikertelen ({group_name}): {e}")
 
 
-# =================== Segédfüggvények (változatlan, csak röviden) ===================
+# =================== E-mail és adatgyűjtés ===================
 
 def clean_text(text):
     return " ".join(text.split()) if text else ""
@@ -278,21 +316,15 @@ def scrape_main_image(url, soup):
             if not fullurl:
                 continue
             if fullurl.startswith("http"):
-                image_url = fullurl
+                return fullurl
             elif fullurl.startswith("/"):
-                image_url = "https://arveres.nav.gov.hu" + fullurl
+                return "https://arveres.nav.gov.hu" + fullurl
             else:
-                image_url = BASE + fullurl
-            return image_url
+                return BASE + fullurl
         return None
     except Exception as e:
         logger.error(f"Kép scrape hiba: {e}")
         return None
-
-
-def download_image(image_url, session=None):
-    # megtartjuk, de az összevont üzenetekben nem használjuk
-    pass
 
 
 def parse_nav_eaf_details(url, html_text=None):
@@ -374,7 +406,6 @@ def parse_nav_eaf_details(url, html_text=None):
 
     data["image_url"] = scrape_main_image(url, soup)
 
-    # Távolság számítás
     megtekintes_hely = data.get("megtekintes_hely", "")
     if megtekintes_hely:
         result = get_drive_distance(megtekintes_hely)
@@ -386,7 +417,6 @@ def parse_nav_eaf_details(url, html_text=None):
     else:
         data["tavolsag"] = "N/A"
 
-    # Cím meghatározása (csoportosításhoz)
     if "tetel_megnevezes" in data:
         data["cim"] = data["tetel_megnevezes"]
     elif "kategoria_reszletes" in data:
@@ -399,7 +429,6 @@ def parse_nav_eaf_details(url, html_text=None):
 
 
 def extract_html_from_message(msg):
-    # változatlan – rekurzívan kiszedi a HTML részt az emailből
     if msg.is_multipart():
         for part in msg.walk():
             content_type = part.get_content_type()
@@ -431,17 +460,11 @@ def extract_html_from_message(msg):
 
 
 def get_unread_nav_emails():
-    """
-    Lekéri az összes olvasatlan e-mailt a postaládából, és visszaadja a HTML tartalmukat,
-    de csak azokat, amelyek a NAV Elektronikus Árverés rendszeréből érkeztek.
-    A feldolgozás után megjelöli őket olvasottként.
-    """
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(EMAIL, PASSWORD)
         mail.select("inbox")
 
-        # Csak olvasatlan üzenetek
         status, messages = mail.search(None, '(UNSEEN)')
         if status != "OK" or not messages[0]:
             logger.info("Nincs olvasatlan e-mail.")
@@ -466,27 +489,22 @@ def get_unread_nav_emails():
                     part = part.decode(enc or "utf-8", errors="ignore")
                 subject_str += part
 
-            # NAV e-mail felismerése
             is_nav = (
                 any(sender in from_ for sender in ["-eaf@nav.gov.hu", "eaf@nav.gov.hu"])
                 or "Elektronikus Árverés" in subject_str
                 or "Elektronikus Arveres" in subject_str
             )
             if not is_nav:
-                logger.info(f"Kihagyva (nem NAV): {subject_str}")
-                # Nem NAV e-mailt is megjelölünk olvasottként, hogy ne jöjjön elő újra
                 mail.store(eid, "+FLAGS", "\\Seen")
                 continue
 
             logger.info(f"NAV e-mail: {subject_str} | Feladó: {from_}")
-
             html_body = extract_html_from_message(msg)
             if html_body:
                 result.append(html_body)
             else:
                 logger.warning(f"Nincs HTML tartalom a NAV e-mailben: {subject_str}")
 
-            # Megjelöljük olvasottként, hogy többet ne dolgozzuk fel
             mail.store(eid, "+FLAGS", "\\Seen")
 
         mail.close()
@@ -501,20 +519,16 @@ def get_unread_nav_emails():
 # =================== Fő logika ===================
 
 def main():
-    logger.info(f"=== NAV EAF Scraper v2.00 (UNSEEN, összevonás) indítás: {datetime.now().strftime('%Y.%m.%d %H:%M')} ===")
+    logger.info(f"=== NAV EAF Scraper v2.02 (összevonás, kép csak első tételhez) indítás: {datetime.now().strftime('%Y.%m.%d %H:%M')} ===")
 
-    # 1. Látott URL-ek betöltése
     seen_urls = load_seen_urls()
     logger.info(f"Már ismert URL-ek száma: {len(seen_urls)}")
 
-    # 2. Olvasatlan NAV e-mailek lekérése
     emails_html = get_unread_nav_emails()
     if not emails_html:
         logger.info("Nem érkezett új NAV e-mail.")
-        # Nem küldünk értesítőt, ha nincs új e-mail
         return
 
-    # 3. Linkek kinyerése és részletes adatok letöltése
     all_auctions = []
     for html in emails_html:
         links = extract_nav_eaf_links(html)
@@ -524,35 +538,34 @@ def main():
             if details:
                 all_auctions.append(details)
 
-    # 4. URL alapú deduplikáció az aktuális futáson belül
     unique = list({a["url"]: a for a in all_auctions}.values())
     logger.info(f"Egyedi árverések (aktuális futás): {len(unique)} db")
 
-    # 5. Szűrés: csak azok, amelyekről még NEM küldtünk értesítőt
     new_auctions = filter_new_auctions(unique, seen_urls)
     if not new_auctions:
         logger.info("Nincs új árverés a már látott URL-ekhez képest.")
         return
 
-    # 6. Szétválasztás ingatlan / nem ingatlan
+    # Szétválasztás ingatlan / ingóság
     real_estate = [a for a in new_auctions if is_real_estate(a)]
     other = [a for a in new_auctions if not is_real_estate(a)]
-    logger.info(f"Ingatlan tételek: {len(real_estate)}, egyéb tételek: {len(other)}")
+    logger.info(f"Ingatlan tételek: {len(real_estate)}, ingóságok: {len(other)}")
 
-    # 7. Csoportosítás azonos név szerint
-    other_groups = group_by_name(other)
-    real_estate_groups = group_by_name(real_estate)
+    # Ingóságok csoportosítása -> fő bot
+    if other:
+        other_groups = group_by_name(other)
+        send_grouped_messages(other_groups, bot, CHAT_ID, "ingóságok")
 
-    # 8. Üzenetek küldése a megfelelő botokkal
-    if other_groups:
-        send_grouped_messages(other_groups, bot, CHAT_ID)
-    if real_estate_groups and real_estate_bot:
-        send_grouped_messages(real_estate_groups, real_estate_bot, REAL_ESTATE_CHAT_ID)
-    elif real_estate_groups and not real_estate_bot:
-        logger.warning("Ingatlanok találhatók, de a REAL_ESTATE_BOT_TOKEN / CHAT_ID nincs beállítva. Küldés a fő botra.")
-        send_grouped_messages(real_estate_groups, bot, CHAT_ID)
+    # Ingatlanok csoportosítása -> ingatlan bot (vagy fő bot, ha nincs külön)
+    if real_estate:
+        real_groups = group_by_name(real_estate)
+        if real_estate_bot:
+            send_grouped_messages(real_groups, real_estate_bot, REAL_ESTATE_CHAT_ID, "ingatlanok")
+        else:
+            logger.warning("Ingatlan bot nincs beállítva, ingatlanok a fő botba mennek.")
+            send_grouped_messages(real_groups, bot, CHAT_ID, "ingatlanok")
 
-    # 9. Látott URL-ek frissítése és mentése
+    # Látott URL-ek frissítése
     for a in new_auctions:
         seen_urls.add(a["url"])
     save_seen_urls(seen_urls)
