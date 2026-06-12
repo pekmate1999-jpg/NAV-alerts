@@ -10,6 +10,7 @@ import logging
 import re
 import socket
 import time
+import urllib.parse
 
 # Globális időtúllépés beállítása (45 másodperc)
 socket.setdefaulttimeout(45)
@@ -70,6 +71,51 @@ def save_seen_urls(seen: set):
 
 
 # =================== Segédfüggvények ===================
+
+def generate_gcal_url(title, date_str, location="", details=""):
+    """
+    Készít egy Google Calendar URL-t a megadott adatokból.
+    Felismeri a sima dátumokat és a '-tól -ig' formátumokat is.
+    """
+    if not date_str or date_str == "N/A":
+        return None
+
+    try:
+        # Keresünk minden dátum-idő formátumot a szövegben (YYYY-MM-DD HH:MM)
+        matches = re.findall(r'(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})', date_str)
+        
+        if not matches:
+            return None
+
+        # Kezdési időpont
+        start_dt = datetime.strptime(matches[0], "%Y-%m-%d %H:%M")
+        
+        # Ha van befejezési időpont (pl. megtekintésnél)
+        if len(matches) >= 2:
+            end_dt = datetime.strptime(matches[1], "%Y-%m-%d %H:%M")
+        else:
+            # Ha nincs befejezés, alapértelmezetten 1 órás eseményt csinálunk
+            end_dt = start_dt + timedelta(hours=1)
+
+        # Google Naptár formátum (időzóna nélkül a helyi időt használja)
+        start_str = start_dt.strftime("%Y%m%dT%H%M%00")
+        end_str = end_dt.strftime("%Y%m%dT%H%M%00")
+
+        # URL összeállítása
+        url = f"https://calendar.google.com/calendar/render?action=TEMPLATE"
+        url += f"&text={urllib.parse.quote(title)}"
+        url += f"&dates={start_str}/{end_str}"
+        
+        if location and location != "N/A":
+            url += f"&location={urllib.parse.quote(location)}"
+        if details:
+            url += f"&details={urllib.parse.quote(details)}"
+            
+        return url
+    except Exception as e:
+        logger.warning(f"Nem sikerült a naptár link generálása: {e}")
+        return None
+
 
 def clean_text(text):
     return " ".join(text.split()) if text else ""
@@ -580,10 +626,31 @@ def build_ingatlan_message(a: dict) -> str:
 
     lines.append("")
     lines.append("⚖️ <b>4. Jogi és Árverési Státusz</b>")
-    lines.append(f"▶️ <b>Árverés kezdete:</b> {kezdet}")
-    lines.append(f"🏁 <b>Árverés vége:</b> {befejezes}")
+
+    # Google naptár linkek generálása
+    tetel_cim = ingatlan_nev
+    hely = teljes_cim
+    reszletek = f"További infó: {a.get('url', '')}"
+
+    kezdet_url = generate_gcal_url(f"NAV Árverés Kezdete: {tetel_cim}", kezdet, hely, reszletek)
+    befejezes_url = generate_gcal_url(f"NAV Árverés Vége: {tetel_cim}", befejezes, hely, reszletek)
+
+    if kezdet_url:
+        lines.append(f"▶️ <b>Kezdés:</b> <a href='{kezdet_url}'>{kezdet}</a>")
+    else:
+        lines.append(f"▶️ <b>Árverés kezdete:</b> {kezdet}")
+
+    if befejezes_url:
+        lines.append(f"🏁 <b>Befejezés:</b> <a href='{befejezes_url}'>{befejezes}</a>")
+    else:
+        lines.append(f"🏁 <b>Árverés vége:</b> {befejezes}")
+
     if megtekintes_ido:
-        lines.append(f"🕒 <b>Megtekintés:</b> {megtekintes_ido}")
+        megtekintes_url = generate_gcal_url(f"NAV Megtekintés: {tetel_cim}", megtekintes_ido, hely, reszletek)
+        if megtekintes_url:
+            lines.append(f"🕒 <b>Megtekintés:</b> <a href='{megtekintes_url}'>{megtekintes_ido}</a>")
+        else:
+            lines.append(f"🕒 <b>Megtekintés:</b> {megtekintes_ido}")
 
     if bejegyzesek:
         lines.append("")
@@ -671,12 +738,32 @@ def build_ingosag_message(a: dict) -> str:
 
     lines.extend([
         "",
-        "📅 <b>4. Időpontok és Árverési Státusz</b>",
-        f"▶️ <b>Kezdés:</b> {kezdet}",
-        f"🏁 <b>Befejezés:</b> {befejezes}"
+        "📅 <b>4. Időpontok és Árverési Státusz</b>"
     ])
+    
+    # Google naptár linkek generálása
+    hely = teljes_cim
+    reszletek = f"További infó: {a.get('url', '')}"
+
+    kezdet_url = generate_gcal_url(f"NAV Árverés Kezdete: {tetel_nev}", kezdet, hely, reszletek)
+    befejezes_url = generate_gcal_url(f"NAV Árverés Vége: {tetel_nev}", befejezes, hely, reszletek)
+
+    if kezdet_url:
+        lines.append(f"▶️ <b>Kezdés:</b> <a href='{kezdet_url}'>{kezdet}</a>")
+    else:
+        lines.append(f"▶️ <b>Kezdés:</b> {kezdet}")
+
+    if befejezes_url:
+        lines.append(f"🏁 <b>Befejezés:</b> <a href='{befejezes_url}'>{befejezes}</a>")
+    else:
+        lines.append(f"🏁 <b>Befejezés:</b> {befejezes}")
+
     if megtekintes_ido:
-        lines.append(f"🕒 <b>Megtekintés:</b> {megtekintes_ido}")
+        megtekintes_url = generate_gcal_url(f"NAV Megtekintés: {tetel_nev}", megtekintes_ido, hely, reszletek)
+        if megtekintes_url:
+            lines.append(f"🕒 <b>Megtekintés:</b> <a href='{megtekintes_url}'>{megtekintes_ido}</a>")
+        else:
+            lines.append(f"🕒 <b>Megtekintés:</b> {megtekintes_ido}")
 
     if egyeb_info:
         lines.extend(["", "📝 <b>Leírás:</b>", f"<i>{egyeb_info}</i>"])
