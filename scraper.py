@@ -1,51 +1,26 @@
 import os
-import json
-import imaplib
-import email
-from email.header import decode_header
-import requests
-from bs4 import BeautifulSoup
-from telegram import Bot
-from datetime import datetime
+import sys
 import logging
-import io
-import html as html_escape
-import re
-import PyPDF2  # PDF olvasáshoz
-
-# ------------------- Konfiguráció -------------------
-EMAIL = os.environ.get("EMAIL_ADDRESS")
-PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-
-REAL_ESTATE_BOT_TOKEN = os.environ.get("REAL_ESTATE_BOT_TOKEN")
-REAL_ESTATE_CHAT_ID = os.environ.get("REAL_ESTATE_CHAT_ID")
-
-# MBVK (végrehajtói) tételek külön kezelése – ha nincs külön bot, mehet a főbe
-MBVK_BOT_TOKEN = os.environ.get("MBVK_BOT_TOKEN") or BOT_TOKEN
-MBVK_CHAT_ID = os.environ.get("MBVK_CHAT_ID") or CHAT_ID
-
-ORIGIN_LAT = 47.4344
-ORIGIN_LON = 19.2198
-
-SEEN_URLS_FILE = os.path.join(os.path.dirname(__file__), "seen_urls.json")
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-# Botok inicializálása – csak ha a token nem üres és nem "None"
-def init_bot(token):
-    if token and token.strip() and token != "None":
-        return Bot(token=token)
-    return None
+# Debug: írjuk ki a környezeti változók első pár karakterét
+real_token = os.environ.get("REAL_ESTATE_BOT_TOKEN", "")
+real_chat = os.environ.get("REAL_ESTATE_CHAT_ID", "")
+logger.info(f"REAL_ESTATE_BOT_TOKEN hossza: {len(real_token)}, első 5 karakter: {real_token[:5] if real_token else 'None'}")
+logger.info(f"REAL_ESTATE_CHAT_ID: {real_chat}")
 
-bot = init_bot(BOT_TOKEN)
-real_estate_bot = init_bot(REAL_ESTATE_BOT_TOKEN)
-mbvk_bot = init_bot(MBVK_BOT_TOKEN)
-
-if not bot:
-    logger.error("Fő bot token hiányzik!")
+# Bot inicializálás egyszerűen, try-except
+real_estate_bot = None
+if real_token and real_chat:
+    try:
+        from telegram import Bot
+        real_estate_bot = Bot(token=real_token.strip())
+        logger.info("Ingatlan bot sikeresen inicializálva")
+    except Exception as e:
+        logger.error(f"Ingatlan bot init hiba: {e}")
+else:
+    logger.warning("REAL_ESTATE_BOT_TOKEN vagy CHAT_ID hiányzik")
 
 
 # =================== Látott URL-ek kezelése ===================
