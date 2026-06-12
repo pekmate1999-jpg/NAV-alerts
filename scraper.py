@@ -382,10 +382,11 @@ def get_emails_since(since_date):
         mail.login(EMAIL, PASSWORD)
         mail.select("inbox")
 
-        search_criteria = f'(SINCE "{since_date.strftime("%d-%b-%Y")}")'
+        # MÓDOSÍTÁS: Hozzáadtuk az UNSEEN-t, így csak az olvasatlan leveleket keresi az adott dátum óta
+        search_criteria = f'(UNSEEN SINCE "{since_date.strftime("%d-%b-%Y")}")'
         status, messages = mail.search(None, search_criteria)
         if status != "OK" or not messages[0]:
-            logger.info("Nincs e-mail a megadott időszakban.")
+            logger.info("Nincs új olvasatlan e-mail a megadott időszakban.")
             return []
 
         email_ids = messages[0].split()
@@ -418,6 +419,7 @@ def get_emails_since(since_date):
             if html_body:
                 result.append(html_body)
 
+            # Ez a sor gondoskodik arról, hogy a sikeres feldolgozás után olvasottá váljon:
             mail.store(eid, "+FLAGS", "\\Seen")
 
         mail.close()
