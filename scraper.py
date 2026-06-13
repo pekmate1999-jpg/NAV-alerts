@@ -211,22 +211,43 @@ def extract_nav_eaf_links(html_content):
 
 def simplify_address(address):
     """Fokozatosan egyszerűsített cím-változatok geocódoláshoz."""
-    candidates = [address]
-    cleaned = re.sub(r",?\s*\d+(/\d+)?\s*hrsz\.?", "", address, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(külterület|belterület|tanya)\b", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip().rstrip(",").strip()
-    if cleaned and cleaned != address:
-        candidates.append(cleaned)
+    candidates = []
 
-    city_match = re.match(
-        r"(\d{4}\s+[A-Za-záéíóöőúüűÁÉÍÓÖŐÚÜŰ][A-Za-záéíóöőúüűÁÉÍÓÖŐÚÜŰ\s\-]+?)"
-        r"(?:\s*,|\s+\d|\s+külterület|\s+belterület|$)",
-        cleaned or address
+    # Ha az irányítószám+város minta NEM a cím elején van (pl. "NAV Árverési
+    # Csarnok 4400 Nyíregyháza, Móricz Zsigmond utca 24."), keressük meg
+    # bárhol a szövegben, és a "magot" (prefix nélkül) vegyük fel első,
+    # priorizált jelöltként.
+    core_match = re.search(
+        r"\b\d{4}\s+[A-Za-záéíóöőúüűÁÉÍÓÖŐÚÜŰ].*",
+        address
     )
-    if city_match:
-        city_only = city_match.group(1).strip()
-        if city_only not in candidates:
-            candidates.append(city_only)
+    if core_match:
+        core = core_match.group(0).strip()
+        if core and core != address:
+            candidates.append(core)
+
+    candidates.append(address)
+
+    # hrsz / kül-/belterület eltávolítása minden eddigi jelöltből
+    for base in list(candidates):
+        cleaned = re.sub(r",?\s*\d+(/\d+)?\s*hrsz\.?", "", base, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(külterület|belterület|tanya)\b", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip().rstrip(",").strip()
+        if cleaned and cleaned not in candidates:
+            candidates.append(cleaned)
+
+    # Csak az "irányítószám + város" rész, mint legutolsó fallback
+    for base in list(candidates):
+        city_match = re.match(
+            r"(\d{4}\s+[A-Za-záéíóöőúüűÁÉÍÓÖŐÚÜŰ][A-Za-záéíóöőúüűÁÉÍÓÖŐÚÜŰ\s\-]+?)"
+            r"(?:\s*,|\s+\d|\s+külterület|\s+belterület|$)",
+            base
+        )
+        if city_match:
+            city_only = city_match.group(1).strip()
+            if city_only not in candidates:
+                candidates.append(city_only)
+
     return [c.strip() for c in candidates if c.strip()]
 
 
