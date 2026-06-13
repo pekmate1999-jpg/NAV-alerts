@@ -752,31 +752,8 @@ def build_mnv_ear_message(a: dict) -> str:
 
 # =================== Telegram üzenetküldés ===================
 
-def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
-    if not target_bot_token or not target_chat_id:
-        logger.error("Hiba: Hiányzó Telegram token vagy chat ID!")
-        return
-
-    # Telegram sendPhoto caption limit: 1024 karakter – ha hosszabb, csonkítjuk
-    CAPTION_LIMIT = 1024
-
-    if image_url:
-        try:
-            img_resp = requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-            if img_resp.status_code == 200 and "image" in img_resp.headers.get("Content-Type", ""):
-                url = f"https://api.telegram.org/bot{target_bot_token}/sendPhoto"
-                photo_caption = caption if len(caption) <= CAPTION_LIMIT else caption[:CAPTION_LIMIT - 1] + "…"
-                files = {"photo": ("image.jpg", img_resp.content, "image/jpeg")}
-                data = {"chat_id": target_chat_id, "caption": photo_caption, "parse_mode": "HTML"}
-                resp = requests.post(url, files=files, data=data, timeout=20)
-                if resp.status_code == 200:
-                    logger.info("Sikeresen kiküldve képpel együtt.")
-                    return
-                # Ha a képküldés nem sikerül, szöveges küldésre váltunk
-                logger.warning(f"Képküldési hiba ({resp.status_code}), szöveges küldésre váltás.")
-        except Exception as e:
-            logger.warning(f"Nem sikerült a képet küldeni: {e}")
-
+def _send_text_message(caption, target_bot_token, target_chat_id):
+    """Szöveges Telegram üzenet küldése."""
     try:
         url = f"https://api.telegram.org/bot{target_bot_token}/sendMessage"
         data = {
@@ -792,6 +769,44 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
             logger.error(f"Telegram küldési hiba: {resp.text}")
     except Exception as e:
         logger.error(f"Nem sikerült kommunikálni a Telegram API-val: {e}")
+
+
+def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
+    if not target_bot_token or not target_chat_id:
+        logger.error("Hiba: Hiányzó Telegram token vagy chat ID!")
+        return
+
+    # Ha van kép, mindig megpróbáljuk elküldeni.
+    # Telegram sendPhoto caption limit: 1024 karakter.
+    # Ha a caption hosszabb, a képet caption nélkül küldjük, majd a szöveget külön sendMessage-dzsel.
+    if image_url:
+        try:
+            img_resp = requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            if img_resp.status_code == 200 and "image" in img_resp.headers.get("Content-Type", ""):
+                url = f"https://api.telegram.org/bot{target_bot_token}/sendPhoto"
+                files = {"photo": ("image.jpg", img_resp.content, "image/jpeg")}
+                if len(caption) <= 1024:
+                    # Rövid caption: képpel együtt küldjük
+                    data = {"chat_id": target_chat_id, "caption": caption, "parse_mode": "HTML"}
+                    resp = requests.post(url, files=files, data=data, timeout=20)
+                    if resp.status_code == 200:
+                        logger.info("Sikeresen kiküldve képpel együtt.")
+                        return
+                    logger.warning(f"Képküldési hiba (HTTP {resp.status_code}), fallback szöveges üzenetre.")
+                else:
+                    # Hosszú caption: képet caption nélkül, szöveget utána külön
+                    data = {"chat_id": target_chat_id}
+                    resp = requests.post(url, files=files, data=data, timeout=20)
+                    if resp.status_code == 200:
+                        logger.info("Kép sikeresen kiküldve (caption külön szövegként következik).")
+                        _send_text_message(caption, target_bot_token, target_chat_id)
+                        return
+                    logger.warning(f"Képküldési hiba (HTTP {resp.status_code}), fallback szöveges üzenetre.")
+        except Exception as e:
+            logger.warning(f"Nem sikerült a képet küldeni: {e}")
+
+    # Fallback: ha nincs kép, vagy a képküldés sikertelen
+    _send_text_message(caption, target_bot_token, target_chat_id)
 
 
 def build_ingatlan_message(a: dict, include_link: bool = True) -> str:
