@@ -757,38 +757,26 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
         logger.error("Hiba: Hiányzó Telegram token vagy chat ID!")
         return
 
-    # Telegram caption limit a sendPhoto-nál: 1024 karakter
-    if image_url and len(caption) <= 1024:
+    # Telegram sendPhoto caption limit: 1024 karakter – ha hosszabb, csonkítjuk
+    CAPTION_LIMIT = 1024
+
+    if image_url:
         try:
             img_resp = requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             if img_resp.status_code == 200 and "image" in img_resp.headers.get("Content-Type", ""):
                 url = f"https://api.telegram.org/bot{target_bot_token}/sendPhoto"
+                photo_caption = caption if len(caption) <= CAPTION_LIMIT else caption[:CAPTION_LIMIT - 1] + "…"
                 files = {"photo": ("image.jpg", img_resp.content, "image/jpeg")}
-                data = {"chat_id": target_chat_id, "caption": caption, "parse_mode": "HTML"}
+                data = {"chat_id": target_chat_id, "caption": photo_caption, "parse_mode": "HTML"}
                 resp = requests.post(url, files=files, data=data, timeout=20)
                 if resp.status_code == 200:
                     logger.info("Sikeresen kiküldve képpel együtt.")
                     return
-                # Ha a képküldés mégsem sikerül (pl. más hiba), akkor megyünk tovább a sima szövegesre
+                # Ha a képküldés nem sikerül, szöveges küldésre váltunk
+                logger.warning(f"Képküldési hiba ({resp.status_code}), szöveges küldésre váltás.")
         except Exception as e:
             logger.warning(f"Nem sikerült a képet küldeni: {e}")
-        # Ha a kép letöltése vagy a kérés sikertelen, akkor sima szöveg
 
-    try:
-        url = f"https://api.telegram.org/bot{target_bot_token}/sendMessage"
-        data = {
-            "chat_id": target_chat_id,
-            "text": caption,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        resp = requests.post(url, data=data, timeout=20)
-        if resp.status_code == 200:
-            logger.info("Sikeresen kiküldve sima szövegként.")
-        else:
-            logger.error(f"Telegram küldési hiba: {resp.text}")
-    except Exception as e:
-        logger.error(f"Nem sikerült kommunikálni a Telegram API-val: {e}")
     try:
         url = f"https://api.telegram.org/bot{target_bot_token}/sendMessage"
         data = {
