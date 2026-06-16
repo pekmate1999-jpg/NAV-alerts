@@ -1,8 +1,7 @@
 name: Daily NAV EAF Scraper
 
 on:
-  schedule:
-    - cron: '0 6 * * *'  # UTC 6:00 = magyar idő szerint 7:00 (tél) / 8:00 (nyár)
+  # UTC 6:00 = magyar idő szerint 7:00 (tél) / 8:00 (nyár)
   workflow_dispatch:
 
 jobs:
