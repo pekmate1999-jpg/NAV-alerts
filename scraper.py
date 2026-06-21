@@ -12,6 +12,13 @@ import socket
 import time
 import urllib.parse
 
+try:
+    from rapidfuzz import fuzz
+    RAPIDFUZZ_AVAILABLE = True
+except ImportError:
+    RAPIDFUZZ_AVAILABLE = False
+    logging.warning("rapidfuzz nem elérhető! Futtasd: pip install rapidfuzz")
+
 # Globális időtúllépés beállítása (45 másodperc)
 socket.setdefaulttimeout(45)
 
@@ -39,19 +46,19 @@ logger = logging.getLogger(__name__)
 
 # ------------------- SZŰRŐK (BÁRMIKOR MÓDOSÍTHATÓ) -------------------
 # Ingatlan szűrő: True esetén CSAK az 1/1 tulajdoni hányaddal rendelkező ingatlanok mennek át.
-# Ha szeretnéd a többit is látni, állítsd False-ra.
-CSAK_1_1_TULAJDON = True  
+CSAK_1_1_TULAJDON = True
 
 # Ingóság szűrő: Csak a megadott HUF érték ALATTI becsértékű ingóságokról küld értesítést.
-# Ha ki szeretnéd kapcsolni ezt a korlátot, állítsd None-ra (pl. MAX_INGOSAG_BECSERTEK = None).
 MAX_INGOSAG_BECSERTEK = 2000000
 
 # MNV EAR szűrő: Csak a megadott HUF érték ALATTI kikiáltási árú ingatlanokról küld értesítést.
-# A hírlevélből közvetlenül, scraping nélkül kerülnek kinyerésre.
 MAX_MNV_KIKIALTAS = 2000000
 
+# Fuzzy matching küszöbérték (0-100): magasabb = szigorúbb csoportosítás
+# 70-75 ajánlott: elég laza ahogy a különböző méretű/színű azonos termékek összevonódjanak
+FUZZY_THRESHOLD = 70
+
 # ------------------- FELADÓ SZŰRŐK -------------------
-# Csak ezen domain-ekről érkező, VAGY ezeket tartalmazó forwarded levelek kerülnek feldolgozásra.
 NAV_SENDER_DOMAINS = ["nav.gov.hu", "mnv.hu"]
 
 
@@ -81,10 +88,6 @@ def save_seen_urls(seen: set):
 # =================== Segédfüggvények ===================
 
 def generate_gcal_url(title, date_str, location="", details=""):
-    """
-    Készít egy Google Calendar URL-t a megadott adatokból.
-    Átváltja UTC-vé és ctz paramétert ad hozzá, hogy mobilon/appban se legyen egész napos hiba.
-    """
     if not date_str or date_str == "N/A":
         return None
 
@@ -95,23 +98,16 @@ def generate_gcal_url(title, date_str, location="", details=""):
         bp_tz = None
 
     try:
-        # Keresünk minden dátum-idő formátumot a szövegben (YYYY-MM-DD HH:MM)
         matches = re.findall(r'(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2})', date_str)
-        
         if not matches:
             return None
 
-        # Kezdési időpont
         start_dt = datetime.strptime(matches[0], "%Y-%m-%d %H:%M")
-        
-        # Ha van befejezési időpont (pl. megtekintésnél)
         if len(matches) >= 2:
             end_dt = datetime.strptime(matches[1], "%Y-%m-%d %H:%M")
         else:
-            # Ha nincs befejezés, alapértelmezetten 1 órás eseményt csinálunk
             end_dt = start_dt + timedelta(hours=1)
 
-        # Ha elérhető a zoneinfo, átváltjuk UTC-re (a mobil appok szigorúan ezt kérik)
         if bp_tz:
             start_dt = start_dt.replace(tzinfo=bp_tz)
             end_dt = end_dt.replace(tzinfo=bp_tz)
@@ -123,17 +119,14 @@ def generate_gcal_url(title, date_str, location="", details=""):
             start_str = start_dt.strftime("%Y%m%dT%H%M%SZ")
             end_str = end_dt.strftime("%Y%m%dT%H%M%SZ")
 
-        # URL összeállítása
         url = f"https://calendar.google.com/calendar/render?action=TEMPLATE"
         url += f"&text={urllib.parse.quote(title)}"
         url += f"&dates={start_str}/{end_str}"
         url += f"&ctz=Europe/Budapest"
-        
         if location and location != "N/A":
             url += f"&location={urllib.parse.quote(location)}"
         if details:
             url += f"&details={urllib.parse.quote(details)}"
-            
         return url
     except Exception as e:
         logger.warning(f"Nem sikerült a naptár link generálása: {e}")
@@ -147,11 +140,10 @@ def clean_text(text):
 def escape_html(text):
     if not text:
         return ""
-    return str(text).replace("&", "&").replace("<", "<").replace(">", ">")
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def parse_price_to_int(price_str):
-    """Szöveges árból (pl. '2 500 000 HUF') tiszta egészet csinál az összehasonlításhoz."""
     if not price_str:
         return 0
     cleaned = re.sub(r'[^\d]', '', price_str.replace('\xa0', ''))
@@ -159,7 +151,6 @@ def parse_price_to_int(price_str):
 
 
 def calculate_darabar(price_str, db_str):
-    """Kiszámolja a darabárat, ha a darabszám meg van adva és > 1."""
     if not price_str or not db_str:
         return None
     try:
@@ -167,7 +158,6 @@ def calculate_darabar(price_str, db_str):
         p_match = re.search(r"(\d+)", p_clean)
         d_clean = db_str.replace(" ", "").replace("\xa0", "")
         d_match = re.search(r"(\d+)", d_clean)
-        
         if p_match and d_match:
             price = int(p_match.group(1))
             db = int(d_match.group(1))
@@ -180,19 +170,15 @@ def calculate_darabar(price_str, db_str):
 
 
 def remove_sablon_szoveg(text):
-    """Eltávolítja a NAV-os sablonszövegeket a leírásból."""
     if not text:
         return ""
-    
     sablonok = [
         "Az elárverezett vagyontárgyakért sem az adós, sem az adóhatóság jótállással nem tartozik. A megtekintés során a résztvevők által nem észlelt vagy fel nem ismerhető rejtett hibákért, a vagyontárgy esetlegesen előforduló vélt vagy valós hiányosságaiért az adóhatóság felelősséget nem vállal.",
         "Az elárverezett vagyontárgyakért sem az adós, sem az adóhatóság jótállással nem tartozik.",
         "A megtekintés során a résztvevők által nem észlelt vagy fel nem ismerhető rejtett hibákért, a vagyontárgy esetlegesen előforduló vélt vagy valós hiányosságaiért az adóhatóság felelősséget nem vállal."
     ]
-    
     for s in sablonok:
         text = text.replace(s, "")
-        
     return " ".join(text.split()).strip()
 
 
@@ -210,44 +196,22 @@ def extract_nav_eaf_links(html_content):
 
 
 def simplify_address(address):
-    """Fokozatosan egyszerűsített cím-változatok geocódoláshoz."""
-    candidates = []
+    candidates = [address]
+    cleaned = re.sub(r",?\s*\d+(/\d+)?\s*hrsz\.?", "", address, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(külterület|belterület|tanya)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip().rstrip(",").strip()
+    if cleaned and cleaned != address:
+        candidates.append(cleaned)
 
-    # Ha az irányítószám+város minta NEM a cím elején van (pl. "NAV Árverési
-    # Csarnok 4400 Nyíregyháza, Móricz Zsigmond utca 24."), keressük meg
-    # bárhol a szövegben, és a "magot" (prefix nélkül) vegyük fel első,
-    # priorizált jelöltként.
-    core_match = re.search(
-        r"\b\d{4}\s+[A-Za-záéíóöőúüűÁÉÍÓÖŐÚÜŰ].*",
-        address
+    city_match = re.match(
+        r"(\d{4}\s+[A-Za-záéíóöőúüűÁÉÍÓÖŐÚÜŰ][A-Za-záéíóöőúüűÁÉÍÓÖŐÚÜŰ\s\-]+?)"
+        r"(?:\s*,|\s+\d|\s+külterület|\s+belterület|$)",
+        cleaned or address
     )
-    if core_match:
-        core = core_match.group(0).strip()
-        if core and core != address:
-            candidates.append(core)
-
-    candidates.append(address)
-
-    # hrsz / kül-/belterület eltávolítása minden eddigi jelöltből
-    for base in list(candidates):
-        cleaned = re.sub(r",?\s*\d+(/\d+)?\s*hrsz\.?", "", base, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\b(külterület|belterület|tanya)\b", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip().rstrip(",").strip()
-        if cleaned and cleaned not in candidates:
-            candidates.append(cleaned)
-
-    # Csak az "irányítószám + város" rész, mint legutolsó fallback
-    for base in list(candidates):
-        city_match = re.match(
-            r"(\d{4}\s+[A-Za-záéíóöőúüűÁÉÍÓÖŐÚÜŰ][A-Za-záéíóöőúüűÁÉÍÓÖŐÚÜŰ\s\-]+?)"
-            r"(?:\s*,|\s+\d|\s+külterület|\s+belterület|$)",
-            base
-        )
-        if city_match:
-            city_only = city_match.group(1).strip()
-            if city_only not in candidates:
-                candidates.append(city_only)
-
+    if city_match:
+        city_only = city_match.group(1).strip()
+        if city_only not in candidates:
+            candidates.append(city_only)
     return [c.strip() for c in candidates if c.strip()]
 
 
@@ -293,7 +257,6 @@ def get_drive_distance(coords):
 
 
 def scrape_main_image(soup):
-    """Első kép az oldalról (fullurl attribútum vagy képgaléria)."""
     BASE = "https://arveres.nav.gov.hu"
     try:
         for img_tag in soup.find_all("img"):
@@ -325,7 +288,6 @@ FIELD_MAP = {
     "Árverés befejezése":                       "befejezes",
     "Az árverezett tétel megtekinthető, hely":  "megtekintes_hely",
     "Az árverezett tétel megtekinthető, idő":   "megtekintes_ido",
-    # Ingatlan tétel adatok
     "Ingatlan megnevezése":                     "ingatlan_megnevezes",
     "Tétel megnevezése":                        "tetel_megnevezes",
     "Becsérték":                                "becsertek",
@@ -333,13 +295,11 @@ FIELD_MAP = {
     "Minimál ajánlat":                          "minimal_ajanlat",
     "Egyéb infó":                               "egyeb_info",
     "Van előárverezésre jogosult":              "eloarverezesre_jogosult",
-    # Cím
     "Ország":                                   "orszag",
     "Megye":                                    "megye_tabla",
     "Cím irányítószám, város":                  "varos",
     "Cím utca":                                 "utca",
     "Házszám, emelet, ajtó":                    "hazszam",
-    # Ingatlan jellemzők
     "Tulajdoni hányad":                         "tulajdoni_hanyad",
     "Helyrajzi szám":                           "helyrajzi_szam",
     "Terület":                                  "terulet",
@@ -349,7 +309,6 @@ FIELD_MAP = {
     "8. Növényzete":                            "novenyzet",
     "9. Kerítése":                              "kerites",
     "Kerítés anyaga":                           "kerites_anyaga",
-    # Ingóság jellemzők
     "Állapot":                                  "allapot",
     "Egyszerre árverezett tétel darabszám":     "darabszam",
 }
@@ -413,7 +372,6 @@ def parse_nav_eaf_details(url):
 
             if not matched and "Bejegyzések a tulajdoni lapon" in key:
                 data["tulajdoni_lap_bejegyzesek"] = value
-
             if not matched and "Egyéb megjegyzések" in key:
                 data["egyeb_megjegyzesek"] = value
 
@@ -505,18 +463,10 @@ def _decode_subject(msg) -> str:
 
 
 def _classify_email(msg, subject_str: str, html_body: str) -> str:
-    """
-    Visszaadja a levél típusát:
-      'nav_eaf' – NAV Elektronikus Árverés (közvetlenül vagy forwarded)
-      'mnv_ear' – MNV EAR Heti hírlevél (közvetlenül vagy forwarded)
-      'skip'    – nem releváns, kihagyandó
-    Csak NAV/MNV domain-ről érkező vagy tőlük forwarded leveleket fogad el.
-    """
     from_header = msg.get("From", "").lower()
     subj_l = subject_str.lower()
     html_l = (html_body or "").lower()
 
-    # --- MNV EAR felismerés ---
     mnv_signals = [
         any(d in from_header for d in ["mnv.hu"]),
         "mnv ear" in subj_l,
@@ -525,13 +475,11 @@ def _classify_email(msg, subject_str: str, html_body: str) -> str:
         "meghirdetett árverésekről" in subj_l,
         "no-reply-ear@mnv.hu" in html_l,
         "ear.mnv.hu" in html_l,
-        # forwarded esetén a törzsben szerepelhet a feladó
         ("mnv" in html_l and "ear" in html_l and "hírlevél" in html_l),
     ]
     if any(mnv_signals):
         return "mnv_ear"
 
-    # --- NAV EAF felismerés ---
     nav_signals = [
         any(d in from_header for d in ["nav.gov.hu"]),
         "elektronikus árverés" in subj_l,
@@ -546,11 +494,6 @@ def _classify_email(msg, subject_str: str, html_body: str) -> str:
 
 
 def get_emails_since(since_date):
-    """
-    Visszaadja az olvasatlan NAV/MNV levelek HTML tartalmát két listában:
-      (nav_eaf_htmls, mnv_ear_htmls)
-    Csak NAV EAF vagy MNV EAR feladóktól (vagy tőlük forwarded) érkező leveleket dolgoz fel.
-    """
     try:
         logger.info("Kapcsolódás a Gmail IMAP szerverhez...")
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -576,7 +519,6 @@ def get_emails_since(since_date):
 
         for idx, eid in enumerate(msg_ids, 1):
             logger.info(f" -> [{idx}/{len(msg_ids)}] E-mail letöltése (ID: {eid.decode()})...")
-            # BODY.PEEK[]: letölti a levelet anélkül, hogy automatikusan olvasottnak jelölné
             status, msg_data = mail.fetch(eid, "(BODY.PEEK[])")
             if status != "OK":
                 continue
@@ -608,10 +550,8 @@ def get_emails_since(since_date):
         return [], []
 
 
-# =================== MNV EAR hírlevél feldolgozása (scraping nélkül) ===================
+# =================== MNV EAR hírlevél feldolgozása ===================
 
-# A felismerni kívánt mezőcímkék és a hozzájuk tartozó dict kulcsok.
-# FONTOS: sorrendben kell tartani – a sor-alapú parser erre támaszkodik.
 MNV_LABEL_FIELD = [
     ("Árverés alkategória neve",                    "alkategoria"),
     ("Árverezett tétel megnevezése, azonosítója",   "tetel_nev_azonosito"),
@@ -624,7 +564,6 @@ MNV_LABEL_FIELD = [
 
 
 def _finalize_mnv_auction(auction_data: dict) -> dict | None:
-    """Egyedi azonosítót és rövid cím-verziót told bele a dict-be; None-t ad vissza ha hiányos."""
     if "tetel_nev_azonosito" not in auction_data or "kikialtas_ar" not in auction_data:
         return None
     raw_nev = auction_data.get("tetel_nev_azonosito", "")
@@ -636,19 +575,6 @@ def _finalize_mnv_auction(auction_data: dict) -> dict | None:
 
 
 def parse_mnv_ear_auctions(html_content: str) -> list:
-    """
-    Kinyeri az MNV EAR hírlevél árverési tételeit HTML-tartalmából.
-
-    A HTML-t BeautifulSoup-pal szöveggé alakítja, majd soronként dolgozza fel.
-    Ez az eljárás forwarded Gmail-leveleknél is megbízhatóan működik,
-    hiszen nem függ a HTML táblázat-struktúrájától.
-
-    Logika:
-      - Minden „Árverés alkategória neve" sort új árverési blokk kezdetének tekint.
-      - Az egyes mezők értéke lehet ugyanazon a soron (pl. „Kikiáltási ár  64 770 000 Ft")
-        VAGY a következő nem-üres, nem-mezőcímke soron.
-      - Egy blokk lezárul, ha újabb „Árverés alkategória neve" sort talál.
-    """
     soup = BeautifulSoup(html_content, "html.parser")
     raw_text = soup.get_text(separator="\n")
     lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
@@ -659,7 +585,6 @@ def parse_mnv_ear_auctions(html_content: str) -> list:
         return any(lbl in line for lbl in all_labels)
 
     def next_value(lines: list, idx: int) -> str:
-        """A következő nem-üres, nem-mezőcímke sort adja vissza értékként."""
         j = idx + 1
         while j < len(lines):
             if lines[j] and not is_label(lines[j]):
@@ -678,14 +603,12 @@ def parse_mnv_ear_auctions(html_content: str) -> list:
             if label not in line:
                 continue
 
-            # Új blokk indul – az előző mentése ha kész
             if field == "alkategoria" and current:
                 result = _finalize_mnv_auction(current)
                 if result:
                     auctions.append(result)
                 current = {}
 
-            # Érték kinyerése: ugyanazon a soron a label után, vagy a következő soron
             after_label = line[line.index(label) + len(label):].strip().lstrip(":").strip()
             if after_label:
                 current[field] = after_label
@@ -693,12 +616,11 @@ def parse_mnv_ear_auctions(html_content: str) -> list:
                 val = next_value(lines, i)
                 if val:
                     current[field] = val
-                    i += 1  # következő sort már feldolgoztuk
+                    i += 1
             break
 
         i += 1
 
-    # Utolsó blokk mentése
     if current:
         result = _finalize_mnv_auction(current)
         if result:
@@ -709,7 +631,6 @@ def parse_mnv_ear_auctions(html_content: str) -> list:
 
 
 def build_mnv_ear_message(a: dict) -> str:
-    """Telegram értesítő MNV EAR hírlevélből kinyert ingatlanhoz."""
     alkategoria = escape_html(a.get("alkategoria") or "Ingatlan")
     tetel = escape_html(a.get("tetel_nev_azonosito") or "Ismeretlen")
     ar = escape_html(a.get("kikialtas_ar") or "N/A")
@@ -718,14 +639,12 @@ def build_mnv_ear_message(a: dict) -> str:
     kezdet = escape_html(a.get("kezdet") or "N/A")
     befejezes = escape_html(a.get("befejezes") or "N/A")
 
-    # MNV EAR dinamikus link előállítása az azonosítóból (javítva a valós formátumra)
-    mnv_id = a.get("mnv_id")  # pl. "50002/260611"
+    mnv_id = a.get("mnv_id")
     auction_link = "#"
     if mnv_id:
         match = re.match(r'(\d+)/', mnv_id)
         if match:
             auction_id = match.group(1)
-            # Helyes link: https://e-arveres.mnv.hu//index-ingosag.html?.actionId=...&auctionId=...
             auction_link = f"https://e-arveres.mnv.hu//index-ingosag.html?.actionId=action.auction.AuctionSummaryAction&auctionId={auction_id}&FRAME_SKIP_DEJAVU=1"
 
     reszletek = f"Kikiáltási ár: {a.get('kikialtas_ar', 'N/A')} | MNV EAR árverés"
@@ -773,8 +692,25 @@ def build_mnv_ear_message(a: dict) -> str:
 
 # =================== Telegram üzenetküldés ===================
 
-def _send_text_message(caption, target_bot_token, target_chat_id):
-    """Szöveges Telegram üzenet küldése."""
+def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
+    if not target_bot_token or not target_chat_id:
+        logger.error("Hiba: Hiányzó Telegram token vagy chat ID!")
+        return
+
+    if image_url and len(caption) <= 1024:
+        try:
+            img_resp = requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            if img_resp.status_code == 200 and "image" in img_resp.headers.get("Content-Type", ""):
+                url = f"https://api.telegram.org/bot{target_bot_token}/sendPhoto"
+                files = {"photo": ("image.jpg", img_resp.content, "image/jpeg")}
+                data = {"chat_id": target_chat_id, "caption": caption, "parse_mode": "HTML"}
+                resp = requests.post(url, files=files, data=data, timeout=20)
+                if resp.status_code == 200:
+                    logger.info("Sikeresen kiküldve képpel együtt.")
+                    return
+        except Exception as e:
+            logger.warning(f"Nem sikerült a képet küldeni: {e}")
+
     try:
         url = f"https://api.telegram.org/bot{target_bot_token}/sendMessage"
         data = {
@@ -792,47 +728,7 @@ def _send_text_message(caption, target_bot_token, target_chat_id):
         logger.error(f"Nem sikerült kommunikálni a Telegram API-val: {e}")
 
 
-def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
-    if not target_bot_token or not target_chat_id:
-        logger.error("Hiba: Hiányzó Telegram token vagy chat ID!")
-        return
-
-    # Ha van kép, mindig megpróbáljuk elküldeni.
-    # Telegram sendPhoto caption limit: 1024 karakter.
-    # Ha a caption hosszabb, a képet caption nélkül küldjük, majd a szöveget külön sendMessage-dzsel.
-    if image_url:
-        try:
-            img_resp = requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-            if img_resp.status_code == 200 and "image" in img_resp.headers.get("Content-Type", ""):
-                url = f"https://api.telegram.org/bot{target_bot_token}/sendPhoto"
-                files = {"photo": ("image.jpg", img_resp.content, "image/jpeg")}
-                if len(caption) <= 1024:
-                    # Rövid caption: képpel együtt küldjük
-                    data = {"chat_id": target_chat_id, "caption": caption, "parse_mode": "HTML"}
-                    resp = requests.post(url, files=files, data=data, timeout=20)
-                    if resp.status_code == 200:
-                        logger.info("Sikeresen kiküldve képpel együtt.")
-                        return
-                    logger.warning(f"Képküldési hiba (HTTP {resp.status_code}), fallback szöveges üzenetre.")
-                else:
-                    # Hosszú caption: képet caption nélkül, szöveget utána külön
-                    data = {"chat_id": target_chat_id}
-                    resp = requests.post(url, files=files, data=data, timeout=20)
-                    if resp.status_code == 200:
-                        logger.info("Kép sikeresen kiküldve (caption külön szövegként következik).")
-                        _send_text_message(caption, target_bot_token, target_chat_id)
-                        return
-                    logger.warning(f"Képküldési hiba (HTTP {resp.status_code}), fallback szöveges üzenetre.")
-        except Exception as e:
-            logger.warning(f"Nem sikerült a képet küldeni: {e}")
-
-    # Fallback: ha nincs kép, vagy a képküldés sikertelen
-    _send_text_message(caption, target_bot_token, target_chat_id)
-
-
 def build_ingatlan_message(a: dict, include_link: bool = True) -> str:
-    """MBVK-stílusú Telegram üzenet ingatlan árverésekhez (Ügyszám nélkül)."""
-
     arveres_nev = escape_html(a.get("kategoria_reszletes") or a.get("kategoria") or "Ingatlan árverés")
     ingatlan_nev = escape_html(a.get("ingatlan_megnevezes") or a.get("cim") or "Ismeretlen")
     teljes_cim = escape_html(a.get("teljes_cim") or "Ismeretlen cím")
@@ -856,10 +752,8 @@ def build_ingatlan_message(a: dict, include_link: bool = True) -> str:
     kerites_anyaga = escape_html(a.get("kerites_anyaga") or "")
     talaj = escape_html(a.get("talaj_minoseg") or "")
     novenyzet = escape_html(a.get("novenyzet") or "")
-
     bejegyzesek = escape_html(a.get("tulajdoni_lap_bejegyzesek") or "")
-    
-    # Sablonszöveg szűrése
+
     egyeb_info = a.get("egyeb_info") or a.get("egyeb_megjegyzesek") or ""
     egyeb_info = remove_sablon_szoveg(egyeb_info)
     if len(egyeb_info) > 500:
@@ -915,7 +809,6 @@ def build_ingatlan_message(a: dict, include_link: bool = True) -> str:
     lines.append("")
     lines.append("⚖️ <b>4. Jogi és Árverési Státusz</b>")
 
-    # Google naptár linkek generálása
     tetel_cim = ingatlan_nev
     hely = teljes_cim
     reszletek = f"További infó: {a.get('url', '')}"
@@ -950,7 +843,6 @@ def build_ingatlan_message(a: dict, include_link: bool = True) -> str:
         lines.append("📝 <b>Leírás:</b>")
         lines.append(f"<i>{egyeb_info}</i>")
 
-    # Linkek (opcionális)
     if include_link:
         lines.append("")
         lines.append(f"🔗 <a href='{a.get('url', '')}'>Részletek a NAV oldalon</a>")
@@ -961,18 +853,16 @@ def build_ingatlan_message(a: dict, include_link: bool = True) -> str:
 
 
 def build_ingosag_message(a: dict, include_link: bool = True) -> str:
-    """Ingóság árverési Telegram üzenet (Ügyszám nélkül, darabárral)."""
-
     arveres_nev = escape_html(a.get("kategoria_reszletes") or a.get("kategoria") or "Árverés")
     tetel_nev = escape_html(a.get("cim") or "Ismeretlen tétel")
     becsertek = escape_html(a.get("becsertek") or "N/A")
-    
+
     minimal_ajanlat_raw = a.get("minimal_ajanlat") or "N/A"
     minimal_ajanlat = escape_html(minimal_ajanlat_raw)
-    
+
     darabszam_raw = a.get("darabszam") or ""
     darabszam = escape_html(darabszam_raw)
-    
+
     kezdet = escape_html(a.get("kezdet") or "N/A")
     befejezes = escape_html(a.get("befejezes") or "N/A")
     allapot = escape_html(a.get("allapot") or "")
@@ -984,10 +874,8 @@ def build_ingosag_message(a: dict, include_link: bool = True) -> str:
         a.get("teljes_cim") or a.get("megtekintes_hely") or "Ismeretlen helyszín"
     )
 
-    # Darabár kalkulálása a segédfüggvénnyel
     darabar = calculate_darabar(minimal_ajanlat_raw, darabszam_raw)
 
-    # Sablonszöveg szűrése
     egyeb_info = a.get("egyeb_info") or ""
     egyeb_info = remove_sablon_szoveg(egyeb_info)
     if len(egyeb_info) > 400:
@@ -1021,8 +909,7 @@ def build_ingosag_message(a: dict, include_link: bool = True) -> str:
         f"💵 <b>Becsérték:</b> {becsertek}",
         f"📉 <b>Minimál ajánlat:</b> {minimal_ajanlat}",
     ])
-    
-    # Ha van számolható darabár, megjelenítjük a minimál ajánlat alatt
+
     if darabar:
         lines.append(f"💲 <b>Minimum darabár:</b> {darabar}")
 
@@ -1030,8 +917,7 @@ def build_ingosag_message(a: dict, include_link: bool = True) -> str:
         "",
         "📅 <b>4. Időpontok és Árverési Státusz</b>"
     ])
-    
-    # Google naptár linkek generálása
+
     hely = teljes_cim
     reszletek = f"További infó: {a.get('url', '')}"
 
@@ -1058,7 +944,6 @@ def build_ingosag_message(a: dict, include_link: bool = True) -> str:
     if egyeb_info:
         lines.extend(["", "📝 <b>Leírás:</b>", f"<i>{egyeb_info}</i>"])
 
-    # Linkek (opcionális)
     if include_link:
         lines.extend(["", f"🔗 <a href='{a.get('url', '')}'>Részletek a NAV oldalon</a>"])
         if a.get("maps_url"):
@@ -1067,34 +952,91 @@ def build_ingosag_message(a: dict, include_link: bool = True) -> str:
     return "\n".join(lines)
 
 
-# =================== Tételnév normalizálása a csoportosításhoz ===================
+# =================== Fuzzy csoportosítás ===================
 
-def normalize_item_name(name: str) -> str:
+def normalize_for_fuzzy(name: str) -> str:
     """
-    A tétel nevéből egy normalizált kulcsot készít a csoportosításhoz.
-    Kifejezetten a mountain bike és takaróponyva tételeknél összevonja a különböző méreteket.
-    Más tételeknél az eredeti nevet adja vissza (kisbetűsítve).
+    A tétel nevét előkészíti a fuzzy összehasonlításhoz:
+    - kisbetűsít
+    - eltávolítja a mértékegységeket és számokat (méret, mennyiség)
+    - eltávolítja a felesleges szóközöket
+    Így pl. "Zellia Primer 10ml" és "Zellia Primer 5ml" azonosnak fog tűnni.
     """
     if not name:
         return ""
-    lower_name = name.lower().strip()
-    
-    # Mountain bike (26", 24", stb.) összevonása
-    if "mountain" in lower_name and "bike" in lower_name:
-        return "mountainbike"
-    
-    # Takaróponyva (különböző méretek) összevonása
-    if "takaróponyva" in lower_name or "takaro ponyva" in lower_name:
-        return "takaróponyva"
-    
-    # Egyéb tétel: marad az eredeti név (kisbetűsítve)
-    return lower_name
+    lower = name.lower().strip()
+    # Mértékegységek és számok eltávolítása
+    cleaned = re.sub(
+        r'\b\d+\s*(ml|g|kg|db|cm|mm|m|l|cl|dl|ft|huf|%|")\b',
+        '',
+        lower,
+        flags=re.IGNORECASE
+    )
+    # Maradék számok eltávolítása (pl. méretjelzések)
+    cleaned = re.sub(r'\b\d+\b', '', cleaned)
+    # Felesleges írásjelek és szóközök eltávolítása
+    cleaned = re.sub(r'[,.\-_/\\]+', ' ', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+
+def group_auctions_by_similarity(auctions: list, threshold: int = FUZZY_THRESHOLD) -> dict:
+    """
+    A tétel neveket fuzzy string matching segítségével hasonlítja össze.
+    Ha két név hasonlósága eléri a threshold%-ot, ugyanabba a csoportba kerülnek.
+    A rapidfuzz könyvtár token_sort_ratio módszerét használja, ami szórend-független.
+
+    Fallback: ha a rapidfuzz nem elérhető, pontos névegyezéssel csoportosít.
+    """
+    if not auctions:
+        return {}
+
+    # Normalizált nevek előkészítése
+    normalized_names = []
+    for a in auctions:
+        raw = a.get("cim") or a.get("ingatlan_megnevezes") or a.get("tetel_megnevezes") or a.get("kategoria_reszletes") or ""
+        normalized_names.append(normalize_for_fuzzy(raw))
+
+    grouped = {}
+    used = set()
+
+    for i, a in enumerate(auctions):
+        if i in used:
+            continue
+
+        group = [a]
+        used.add(i)
+
+        for j, b in enumerate(auctions):
+            if j in used:
+                continue
+
+            if RAPIDFUZZ_AVAILABLE:
+                score = fuzz.token_sort_ratio(normalized_names[i], normalized_names[j])
+            else:
+                # Fallback: pontos egyezés a normalizált névvel
+                score = 100 if normalized_names[i] == normalized_names[j] else 0
+
+            if score >= threshold:
+                logger.info(
+                    f"  [FUZZY] Csoport: '{normalized_names[i]}' <-> '{normalized_names[j]}' "
+                    f"({score}% hasonlóság) → összevonva"
+                )
+                group.append(b)
+                used.add(j)
+
+        # Csoport kulcsa: az első tétel normalizált neve (vagy URL ha nincs)
+        key = normalized_names[i] or auctions[i]["url"]
+        grouped[key] = group
+
+    logger.info(f"Fuzzy csoportosítás eredménye: {len(auctions)} tételből {len(grouped)} csoport")
+    return grouped
 
 
 # =================== Fő logika ===================
 
 def main():
-    logger.info("=== SCRAPER V2.2 INDÍTÁSA ===")
+    logger.info("=== SCRAPER V2.3 INDÍTÁSA ===")
     since = datetime.now(timezone.utc) - timedelta(days=1)
     seen_urls = load_seen_urls()
 
@@ -1105,7 +1047,7 @@ def main():
         return
 
     # =====================================================================
-    # 1. NAV EAF feldolgozás – scraping + csoportosítás normalizált név szerint
+    # 1. NAV EAF feldolgozás – scraping + fuzzy csoportosítás
     # =====================================================================
     all_auctions = []
     for html in nav_eaf_htmls:
@@ -1145,16 +1087,8 @@ def main():
 
     logger.info(f"Szűrés után feldolgozandó tételek: {len(filtered_auctions)}")
 
-    # Csoportosítás normalizált név alapján
-    grouped = {}
-    for a in filtered_auctions:
-        # Alap név: lehetőleg a "cim" mező, de ha nincs, akkor más
-        raw_name = a.get("cim") or a.get("ingatlan_megnevezes") or a.get("tetel_megnevezes") or a.get("kategoria_reszletes") or ""
-        if raw_name:
-            key = normalize_item_name(raw_name)
-        else:
-            key = a["url"]  # ha nincs név, egyedi URL
-        grouped.setdefault(key, []).append(a)
+    # Fuzzy csoportosítás normalizált név alapján
+    grouped = group_auctions_by_similarity(filtered_auctions, threshold=FUZZY_THRESHOLD)
 
     for group_key, auctions_list in grouped.items():
         base = auctions_list[0]
@@ -1172,23 +1106,18 @@ def main():
             chat_id = CHAT_ID
             caption = build_ingosag_message(base, include_link=False)
 
-        # Google Térkép link (az első tételé)
         if base.get("maps_url"):
             caption += f"\n🗺 <a href='{base.get('maps_url')}'>Google Térkép</a>"
 
-        # Linkek kezelése
         if len(auctions_list) == 1:
-            # Egyedi tétel: hozzáadjuk a saját linkjét
             caption += f"\n\n🔗 <a href='{base['url']}'>Részletek a NAV oldalon</a>"
         else:
-            # Több tétel: felsoroljuk mindet
             caption += "\n\n📌 <b>Az összes ilyen tétel linkjei:</b>"
             for idx, a in enumerate(auctions_list, 1):
                 caption += f"\n{idx}. <a href='{a['url']}'>Megtekintés a NAV oldalon</a>"
 
         if token and chat_id:
             send_via_requests(caption, base.get("image_url"), token, chat_id)
-            # Az összes URL-t megjelöljük látottként
             for a in auctions_list:
                 seen_urls.add(a["url"])
         else:
@@ -1235,7 +1164,7 @@ def main():
             logger.error("Kihagyva! Hiányzó REAL_ESTATE_BOT_TOKEN vagy REAL_ESTATE_CHAT_ID")
 
     save_seen_urls(seen_urls)
-    logger.info("=== SCRAPER V2.2 SIKERESEN LEFUTOTT ===")
+    logger.info("=== SCRAPER V2.3 SIKERESEN LEFUTOTT ===")
 
 
 if __name__ == "__main__":
