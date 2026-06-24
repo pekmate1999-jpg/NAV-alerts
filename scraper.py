@@ -697,6 +697,7 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
         logger.error("Hiba: Hiányzó Telegram token vagy chat ID!")
         return
 
+    # Ha van kép ÉS a caption belefér a Telegram 1024 karakteres limitjébe
     if image_url and len(caption) <= 1024:
         try:
             img_resp = requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
@@ -708,9 +709,28 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
                 if resp.status_code == 200:
                     logger.info("Sikeresen kiküldve képpel együtt.")
                     return
+                logger.warning(f"Képes küldés sikertelen: {resp.text}")
         except Exception as e:
             logger.warning(f"Nem sikerült a képet küldeni: {e}")
 
+    # Ha van kép de a caption túl hosszú (>1024 karakter):
+    # először küldjük a képet caption nélkül, majd a szöveget külön
+    elif image_url and len(caption) > 1024:
+        try:
+            img_resp = requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            if img_resp.status_code == 200 and "image" in img_resp.headers.get("Content-Type", ""):
+                url = f"https://api.telegram.org/bot{target_bot_token}/sendPhoto"
+                files = {"photo": ("image.jpg", img_resp.content, "image/jpeg")}
+                data = {"chat_id": target_chat_id, "parse_mode": "HTML"}
+                resp = requests.post(url, files=files, data=data, timeout=20)
+                if resp.status_code == 200:
+                    logger.info("Kép sikeresen kiküldve (külön üzenetben).")
+                else:
+                    logger.warning(f"Kép küldése sikertelen: {resp.text}")
+        except Exception as e:
+            logger.warning(f"Nem sikerült a képet küldeni: {e}")
+
+    # Szöveg küldése (mindig, képtől függetlenül)
     try:
         url = f"https://api.telegram.org/bot{target_bot_token}/sendMessage"
         data = {
@@ -721,12 +741,11 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
         }
         resp = requests.post(url, data=data, timeout=20)
         if resp.status_code == 200:
-            logger.info("Sikeresen kiküldve sima szövegként.")
+            logger.info("Szöveg sikeresen kiküldve.")
         else:
-            logger.error(f"Telegram küldési hiba: {resp.text}")
+            logger.error(f"Telegram szöveg küldési hiba: {resp.text}")
     except Exception as e:
         logger.error(f"Nem sikerült kommunikálni a Telegram API-val: {e}")
-
 
 def build_ingatlan_message(a: dict, include_link: bool = True) -> str:
     arveres_nev = escape_html(a.get("kategoria_reszletes") or a.get("kategoria") or "Ingatlan árverés")
