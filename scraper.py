@@ -313,21 +313,51 @@ def simplify_address(address):
     return [c.strip() for c in candidates if c.strip()]
 
 
+def _extract_megye_from_nominatim(address_block: dict) -> str | None:
+    """Kinyeri a megye nevet a Nominatim addressdetails blokkból."""
+    city = (
+        address_block.get("city")
+        or address_block.get("town")
+        or address_block.get("municipality")
+        or ""
+    )
+    county = address_block.get("county", "")
+    if "Budapest" in city:
+        return "Budapest"
+    if county:
+        return county  # pl. "Tolna vármegye"
+    return None
+
+
 def geocode_address(address):
+    """
+    Geokódol egy magyar címet.
+    Visszaad: ((lat, lon), megye_str) vagy None ha nem sikerül.
+    Cache: {"coords": [lat, lon], "megye": "..."} dict.
+    Régi [lat, lon] lista bejegyzések backward-compatible módon kezelve.
+    """
     cache = load_geocode_cache()
     candidates = simplify_address(address)
 
-    # Cache ellenőrzés minden variánson
     for candidate in candidates:
         if candidate in cache:
+            entry = cache[candidate]
             logger.info(f" -> Geokódolás cache-ből: {candidate}")
-            return tuple(cache[candidate])
+            if isinstance(entry, list):
+                return tuple(entry), None
+            return tuple(entry["coords"]), entry.get("megye")
 
     headers = {"User-Agent": "NAV-EAF-Scraper-V2/1.0"}
     for candidate in candidates:
         try:
             logger.info(f" -> Geokódolás megkísérlése ezzel: {candidate}")
-            params = {"q": candidate, "format": "json", "limit": 1, "countrycodes": "hu"}
+            params = {
+                "q": candidate,
+                "format": "json",
+                "limit": 1,
+                "countrycodes": "hu",
+                "addressdetails": 1,
+            }
             resp = fetch_with_retry(
                 "https://nominatim.openstreetmap.org/search",
                 params=params, headers=headers, timeout=10
@@ -335,9 +365,10 @@ def geocode_address(address):
             if resp.status_code == 200 and resp.json():
                 result = resp.json()[0]
                 coords = (float(result["lat"]), float(result["lon"]))
-                cache[candidate] = list(coords)
+                megye = _extract_megye_from_nominatim(result.get("address", {}))
+                cache[candidate] = {"coords": list(coords), "megye": megye}
                 save_geocode_cache(cache)
-                return coords
+                return coords, megye
             time.sleep(1.1)
         except Exception as e:
             logger.warning(f"Geokódolási részhiba ({candidate}): {e}")
@@ -506,10 +537,13 @@ def parse_nav_eaf_details(url):
     geocode_input = data.get("teljes_cim") or data.get("megtekintes_hely", "")
 
     if geocode_input and geocode_input.lower() not in ("ingatlan címén", ""):
-        coords = geocode_address(geocode_input)
-        if coords:
+        geo_result = geocode_address(geocode_input)
+        if geo_result:
+            coords, geo_megye = geo_result
             lat, lon = coords
             data["maps_url"] = f"http://maps.google.com/?q={lat},{lon}"
+            if not data.get("megye") and geo_megye:
+                data["megye"] = geo_megye
             result = get_drive_distance(coords)
             data["tavolsag"] = (
                 f"{result[0]} km ({result[1]} perc autóval)" if result
@@ -519,10 +553,13 @@ def parse_nav_eaf_details(url):
             data["tavolsag"] = "N/A"
     else:
         if data.get("teljes_cim"):
-            coords = geocode_address(data["teljes_cim"])
-            if coords:
+            geo_result = geocode_address(data["teljes_cim"])
+            if geo_result:
+                coords, geo_megye = geo_result
                 lat, lon = coords
                 data["maps_url"] = f"http://maps.google.com/?q={lat},{lon}"
+                if not data.get("megye") and geo_megye:
+                    data["megye"] = geo_megye
                 result = get_drive_distance(coords)
                 data["tavolsag"] = (
                     f"{result[0]} km ({result[1]} perc autóval)" if result
@@ -759,19 +796,30 @@ def build_mnv_ear_message(a: dict) -> str:
     befejezes_url = generate_gcal_url(f"MNV Árverés Vége: {a.get('cim_rovid', '')}", befejezes, "", reszletek)
     hatarido_url = generate_gcal_url(f"MNV Biztosíték határideje: {a.get('cim_rovid', '')}", hatarido, "", reszletek) if hatarido else None
 
+    tavolsag = a.get("tavolsag", "")
+    megye = escape_html(a.get("megye") or "")
+
     lines = [
         "🏛 <b>MNV EAR INGATLAN TALÁLAT</b>",
         f"📋 <b>{alkategoria}</b>",
         "",
         "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
         f"🏷 <b>Tétel:</b> {tetel}",
+    ]
+
+    if megye:
+        lines.append(f"🏛 <b>Megye:</b> {megye}")
+    if tavolsag and tavolsag not in ("N/A", "Nem sikerült kiszámítani"):
+        lines.append(f"🚗 <b>Budapest-távolság:</b> {tavolsag}")
+
+    lines.extend([
         "",
         "💰 <b>2. Pénzügyi Információk</b>",
         f"💵 <b>Kikiáltási ár:</b> {ar}",
         "",
         "📅 <b>3. Időpontok</b>",
         f"📢 <b>Meghirdetve:</b> {meghirdetes}",
-    ]
+    ])
 
     if hatarido:
         if hatarido_url:
@@ -789,10 +837,10 @@ def build_mnv_ear_message(a: dict) -> str:
     else:
         lines.append(f"🏁 <b>Befejezés:</b> {befejezes}")
 
-    lines.extend([
-        "",
-        f"🔗 <a href='{auction_link}'>Megnyitás az MNV EAR rendszerben</a>",
-    ])
+    lines.append("")
+    if a.get("maps_url"):
+        lines.append(f"🗺 <a href='{a.get('maps_url')}'>Google Térkép</a>")
+    lines.append(f"🔗 <a href='{auction_link}'>Megnyitás az MNV EAR rendszerben</a>")
 
     return "\n".join(lines)
 
@@ -1340,6 +1388,26 @@ def main():
             f"-> [MNV ROUTING] Küldés az Ingatlan Botnak: "
             f"{a.get('tetel_nev_azonosito')} | {a.get('kikialtas_ar')}"
         )
+
+        # Geokódolás a cim_rovid alapján (cache-elt, nem lassít sokat)
+        mnv_address = a.get("cim_rovid", "").strip()
+        if mnv_address:
+            geo_result = geocode_address(mnv_address)
+            if geo_result:
+                coords, geo_megye = geo_result
+                lat, lon = coords
+                a["maps_url"] = f"http://maps.google.com/?q={lat},{lon}"
+                a["megye"] = geo_megye or ""
+                result = get_drive_distance(coords)
+                a["tavolsag"] = (
+                    f"{result[0]} km ({result[1]} perc autóval)" if result
+                    else "Nem sikerült kiszámítani"
+                )
+                logger.info(f"   [MNV GEO] {mnv_address} → {a['tavolsag']} | {a['megye']}")
+            else:
+                a["tavolsag"] = "N/A"
+                a["megye"] = ""
+                logger.info(f"   [MNV GEO] Nem sikerült: {mnv_address}")
 
         if REAL_ESTATE_BOT_TOKEN and REAL_ESTATE_CHAT_ID:
             msg = build_mnv_ear_message(a)
