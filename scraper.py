@@ -44,14 +44,21 @@ logger = logging.getLogger(__name__)
 # ------------------- SZŰRŐK (BÁRMIKOR MÓDOSÍTHATÓ) -------------------
 CSAK_1_1_TULAJDON = True
 MAX_INGOSAG_BECSERTEK = 2000000
-MAX_MNV_KIKIALTAS = 2000000
+MAX_MNV_INGATLAN_KIKIALTAS = 2000000   # MNV ingatlan kikiáltási ár limit
+MAX_MNV_INGOSAG_KIKIALTAS = 2000000    # MNV ingóság kikiáltási ár limit
 
 # Maximális távolság Budapesttől km-ben. None = kikapcsolva
 MAX_TAVOLSAG_KM = None
 
-# Kulcsszó szűrők (ingóságnál). INGOSAG_WHITELIST üres = nincs whitelist szűrés.
+# Kulcsszó szűrők (NAV ingóságnál). INGOSAG_WHITELIST üres = nincs whitelist szűrés.
 INGOSAG_WHITELIST: list[str] = []
 INGOSAG_BLACKLIST: list[str] = ["alkatrész", "sérült", "törött"]
+
+# MNV EAR: ingatlan kategóriák (ami NEM szerepel itt, ingóságnak számít)
+MNV_INGATLAN_KATEGORIAK: list[str] = [
+    "ingatlan", "lakás", "ház", "telek", "garázs", "üzlet", "épület",
+    "iroda", "tanya", "föld", "nyaraló", "pince", "műhely", "csarnok",
+]
 
 FUZZY_THRESHOLD = 70
 
@@ -696,6 +703,12 @@ def get_emails_since(since_date):
 
 # =================== MNV EAR hírlevél feldolgozása ===================
 
+def is_mnv_ingatlan(alkategoria: str) -> bool:
+    """True ha az MNV alkategória ingatlan, False ha ingóság."""
+    a = alkategoria.lower()
+    return any(k in a for k in MNV_INGATLAN_KATEGORIAK)
+
+
 MNV_LABEL_FIELD = [
     ("Árverés alkategória neve",                    "alkategoria"),
     ("Árverezett tétel megnevezése, azonosítója",   "tetel_nev_azonosito"),
@@ -775,7 +788,8 @@ def parse_mnv_ear_auctions(html_content: str) -> list:
 
 
 def build_mnv_ear_message(a: dict) -> str:
-    alkategoria = escape_html(a.get("alkategoria") or "Ingatlan")
+    mnv_ingatlan = is_mnv_ingatlan(a.get("alkategoria", ""))
+    alkategoria = escape_html(a.get("alkategoria") or ("Ingatlan" if mnv_ingatlan else "Ingóság"))
     tetel = escape_html(a.get("tetel_nev_azonosito") or "Ismeretlen")
     ar = escape_html(a.get("kikialtas_ar") or "N/A")
     meghirdetes = escape_html(a.get("meghirdetes") or "N/A")
@@ -799,8 +813,10 @@ def build_mnv_ear_message(a: dict) -> str:
     tavolsag = a.get("tavolsag", "")
     megye = escape_html(a.get("megye") or "")
 
+    header = "🏛 <b>MNV EAR INGATLAN TALÁLAT</b>" if mnv_ingatlan else "🔔 <b>MNV EAR INGÓSÁG TALÁLAT</b>"
+
     lines = [
-        "🏛 <b>MNV EAR INGATLAN TALÁLAT</b>",
+        header,
         f"📋 <b>{alkategoria}</b>",
         "",
         "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
@@ -904,7 +920,10 @@ def send_summary(stats: dict):
     if not BOT_TOKEN or not CHAT_ID:
         return
 
-    total_sent = stats["elkuld_ingosag"] + stats["elkuld_ingatlan"] + stats["elkuld_mnv"]
+    total_sent = (
+        stats["elkuld_ingosag"] + stats["elkuld_ingatlan"]
+        + stats["elkuld_mnv_ingatlan"] + stats["elkuld_mnv_ingosag"]
+    )
 
     lines = [
         "📊 <b>Napi összefoglaló – Scraper V2.4</b>",
@@ -913,9 +932,10 @@ def send_summary(stats: dict):
         f"🔍 Talált NAV tételek: {stats['nav_talalt']}",
         f"🔍 Talált MNV tételek: {stats['mnv_talalt']}",
         f"🚫 Szűrt tételek: {stats['szurt']}",
-        f"✅ Elküldött ingóság: {stats['elkuld_ingosag']}",
-        f"✅ Elküldött NAV ingatlan: {stats['elkuld_ingatlan']}",
-        f"✅ Elküldött MNV ingatlan: {stats['elkuld_mnv']}",
+        f"✅ NAV ingóság: {stats['elkuld_ingosag']}",
+        f"✅ NAV ingatlan: {stats['elkuld_ingatlan']}",
+        f"✅ MNV ingatlan: {stats['elkuld_mnv_ingatlan']}",
+        f"✅ MNV ingóság: {stats['elkuld_mnv_ingosag']}",
         f"<b>📨 Összesen elküldve: {total_sent}</b>",
     ]
 
@@ -1241,7 +1261,8 @@ def main():
         "szurt": 0,
         "elkuld_ingosag": 0,
         "elkuld_ingatlan": 0,
-        "elkuld_mnv": 0,
+        "elkuld_mnv_ingatlan": 0,
+        "elkuld_mnv_ingosag": 0,
     }
 
     nav_eaf_htmls, mnv_ear_htmls = get_emails_since(since)
@@ -1376,16 +1397,31 @@ def main():
         kikialtas_int = parse_price_to_int(a.get("kikialtas_ar", ""))
         if kikialtas_int == 0:
             logger.warning(f"-> [MNV] Nem sikerült az árat értelmezni: {a.get('tetel_nev_azonosito')}")
-        if kikialtas_int >= MAX_MNV_KIKIALTAS:
+
+        # Típus meghatározása az alkategoria alapján
+        mnv_ingatlan = is_mnv_ingatlan(a.get("alkategoria", ""))
+
+        # Típusfüggő ár szűrő
+        ar_limit = MAX_MNV_INGATLAN_KIKIALTAS if mnv_ingatlan else MAX_MNV_INGOSAG_KIKIALTAS
+        if ar_limit is not None and kikialtas_int >= ar_limit:
             logger.info(
-                f"-> [SZŰRŐ] MNV tétel kihagyva (Kikiáltási ár {kikialtas_int:,} Ft >= {MAX_MNV_KIKIALTAS:,} Ft): "
+                f"-> [SZŰRŐ] MNV {'ingatlan' if mnv_ingatlan else 'ingóság'} kihagyva "
+                f"(Kikiáltási ár {kikialtas_int:,} Ft >= {ar_limit:,} Ft): "
                 f"{a.get('tetel_nev_azonosito')}"
             )
             stats["szurt"] += 1
             continue
 
+        # Routing: ingatlan → ingatlan csatorna, ingóság → ingóság csatorna
+        if mnv_ingatlan:
+            mnv_token = REAL_ESTATE_BOT_TOKEN
+            mnv_chat_id = REAL_ESTATE_CHAT_ID
+        else:
+            mnv_token = BOT_TOKEN
+            mnv_chat_id = CHAT_ID
+
         logger.info(
-            f"-> [MNV ROUTING] Küldés az Ingatlan Botnak: "
+            f"-> [MNV ROUTING] {'Ingatlan' if mnv_ingatlan else 'Ingóság'} csatornára: "
             f"{a.get('tetel_nev_azonosito')} | {a.get('kikialtas_ar')}"
         )
 
@@ -1409,14 +1445,20 @@ def main():
                 a["megye"] = ""
                 logger.info(f"   [MNV GEO] Nem sikerült: {mnv_address}")
 
-        if REAL_ESTATE_BOT_TOKEN and REAL_ESTATE_CHAT_ID:
+        if mnv_token and mnv_chat_id:
             msg = build_mnv_ear_message(a)
-            send_via_requests(msg, None, REAL_ESTATE_BOT_TOKEN, REAL_ESTATE_CHAT_ID)
+            send_via_requests(msg, None, mnv_token, mnv_chat_id)
             if mnv_key:
-                mark_seen(seen_urls, mnv_key, save=True)  # Azonnali mentés
-            stats["elkuld_mnv"] += 1
+                mark_seen(seen_urls, mnv_key, save=True)
+            if mnv_ingatlan:
+                stats["elkuld_mnv_ingatlan"] += 1
+            else:
+                stats["elkuld_mnv_ingosag"] += 1
         else:
-            logger.error("Kihagyva! Hiányzó REAL_ESTATE_BOT_TOKEN vagy REAL_ESTATE_CHAT_ID")
+            logger.error(
+                f"Kihagyva! Hiányzó token/chat_id "
+                f"({'ingatlan' if mnv_ingatlan else 'ingóság'} csatorna)"
+            )
 
     send_summary(stats)
     logger.info("=== SCRAPER V2.4 SIKERESEN LEFUTOTT ===")
