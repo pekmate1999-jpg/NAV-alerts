@@ -19,70 +19,144 @@ except ImportError:
     RAPIDFUZZ_AVAILABLE = False
     logging.warning("rapidfuzz nem elérhető! Futtasd: pip install rapidfuzz")
 
-# Globális időtúllépés beállítása (45 másodperc)
 socket.setdefaulttimeout(45)
 
 # ------------------- Konfiguráció -------------------
 EMAIL = os.environ.get("EMAIL_ADDRESS")
 PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
 
-# Alap bot az INGÓSÁGOKNAK
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# Bot az INGATLANOKNAK
 REAL_ESTATE_BOT_TOKEN = os.environ.get("REAL_ESTATE_BOT_TOKEN")
 REAL_ESTATE_CHAT_ID = os.environ.get("REAL_ESTATE_CHAT_ID")
 
-# Távolságszámítási kiindulópont koordinátái (Budapest)
 ORIGIN_LAT = 47.4344
 ORIGIN_LON = 19.2198
 
 SEEN_URLS_FILE = os.path.join(os.path.dirname(__file__), "seen_urls.json")
+GEOCODE_CACHE_FILE = os.path.join(os.path.dirname(__file__), "geocode_cache.json")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
 # ------------------- SZŰRŐK (BÁRMIKOR MÓDOSÍTHATÓ) -------------------
-# Ingatlan szűrő: True esetén CSAK az 1/1 tulajdoni hányaddal rendelkező ingatlanok mennek át.
 CSAK_1_1_TULAJDON = True
-
-# Ingóság szűrő: Csak a megadott HUF érték ALATTI becsértékű ingóságokról küld értesítést.
 MAX_INGOSAG_BECSERTEK = 2000000
-
-# MNV EAR szűrő: Csak a megadott HUF érték ALATTI kikiáltási árú ingatlanokról küld értesítést.
 MAX_MNV_KIKIALTAS = 2000000
 
-# Fuzzy matching küszöbérték (0-100): magasabb = szigorúbb csoportosítás
-# 70-75 ajánlott: elég laza ahogy a különböző méretű/színű azonos termékek összevonódjanak
+# Maximális távolság Budapesttől km-ben. None = kikapcsolva
+MAX_TAVOLSAG_KM = None
+
+# Kulcsszó szűrők (ingóságnál). INGOSAG_WHITELIST üres = nincs whitelist szűrés.
+INGOSAG_WHITELIST: list[str] = []
+INGOSAG_BLACKLIST: list[str] = ["alkatrész", "sérült", "törött"]
+
 FUZZY_THRESHOLD = 70
 
-# ------------------- FELADÓ SZŰRŐK -------------------
+# Ennyi nap után törlődnek a seen_urls bejegyzések
+SEEN_URLS_EXPIRY_DAYS = 90
+
 NAV_SENDER_DOMAINS = ["nav.gov.hu", "mnv.hu"]
 
 
-# =================== Látott URL-ek kezelése ===================
+# =================== Seen URLs – timestamp-alapú, lejáratos ===================
 
-def load_seen_urls() -> set:
+def load_seen_urls() -> dict:
+    """
+    Visszaad egy {url: iso_timestamp} dict-et.
+    Régi lista-formátumú seen_urls.json-t automatikusan migrál.
+    """
     if not os.path.exists(SEEN_URLS_FILE):
-        return set()
+        return {}
     try:
         with open(SEEN_URLS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return set(data.get("seen_urls", []))
+        raw = data.get("seen_urls", {})
+        if isinstance(raw, list):
+            logger.info("seen_urls.json régi lista-formátum – migrálás timestamp-es dict-re.")
+            now = datetime.now(timezone.utc).isoformat()
+            return {url: now for url in raw}
+        return raw
     except Exception as e:
         logger.error(f"Látott URL-ek betöltési hiba: {e}")
-        return set()
+        return {}
 
 
-def save_seen_urls(seen: set):
+def save_seen_urls(seen: dict):
     try:
         with open(SEEN_URLS_FILE, "w", encoding="utf-8") as f:
-            json.dump({"seen_urls": sorted(seen)}, f, ensure_ascii=False, indent=2)
+            json.dump({"seen_urls": seen}, f, ensure_ascii=False, indent=2)
         logger.info(f"Látott URL-ek elmentve ({len(seen)} db).")
     except Exception as e:
         logger.error(f"Látott URL-ek mentési hiba: {e}")
+
+
+def mark_seen(seen: dict, url: str, save: bool = True):
+    """Hozzáad egy URL-t a seen dict-hez és opcionálisan azonnal menti."""
+    seen[url] = datetime.now(timezone.utc).isoformat()
+    if save:
+        save_seen_urls(seen)
+
+
+def clean_expired_seen_urls(seen: dict) -> dict:
+    """Törli a SEEN_URLS_EXPIRY_DAYS napnál régebbi bejegyzéseket."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=SEEN_URLS_EXPIRY_DAYS)
+    cleaned = {}
+    removed = 0
+    for url, ts in seen.items():
+        try:
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt >= cutoff:
+                cleaned[url] = ts
+            else:
+                removed += 1
+        except Exception:
+            cleaned[url] = ts  # ha nem értelmezhető a dátum, megtartjuk
+    if removed:
+        logger.info(f"Lejárt seen_urls bejegyzések törölve: {removed} db")
+    return cleaned
+
+
+# =================== Geocoding cache ===================
+
+def load_geocode_cache() -> dict:
+    if not os.path.exists(GEOCODE_CACHE_FILE):
+        return {}
+    try:
+        with open(GEOCODE_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Geocoding cache betöltési hiba: {e}")
+        return {}
+
+
+def save_geocode_cache(cache: dict):
+    try:
+        with open(GEOCODE_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Geocoding cache mentési hiba: {e}")
+
+
+# =================== Retry-képes HTTP hívás ===================
+
+def fetch_with_retry(url: str, retries: int = 3, backoff: int = 2, **kwargs) -> requests.Response:
+    """requests.get wrapper exponenciális visszalépéssel."""
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return requests.get(url, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if attempt < retries - 1:
+                wait = backoff ** attempt
+                logger.warning(f"HTTP hiba ({attempt + 1}/{retries}): {e} – újrapróbálás {wait}s múlva")
+                time.sleep(wait)
+    raise last_exc
 
 
 # =================== Segédfüggvények ===================
@@ -103,30 +177,34 @@ def generate_gcal_url(title, date_str, location="", details=""):
             return None
 
         start_dt = datetime.strptime(matches[0], "%Y-%m-%d %H:%M")
-        if len(matches) >= 2:
-            end_dt = datetime.strptime(matches[1], "%Y-%m-%d %H:%M")
-        else:
-            end_dt = start_dt + timedelta(hours=1)
+        end_dt = (
+            datetime.strptime(matches[1], "%Y-%m-%d %H:%M")
+            if len(matches) >= 2
+            else start_dt + timedelta(hours=1)
+        )
 
         if bp_tz:
-            start_dt = start_dt.replace(tzinfo=bp_tz)
-            end_dt = end_dt.replace(tzinfo=bp_tz)
-            start_utc = start_dt.astimezone(timezone.utc)
-            end_utc = end_dt.astimezone(timezone.utc)
-            start_str = start_utc.strftime("%Y%m%dT%H%M%SZ")
-            end_str = end_utc.strftime("%Y%m%dT%H%M%SZ")
-        else:
-            start_str = start_dt.strftime("%Y%m%dT%H%M%SZ")
-            end_str = end_dt.strftime("%Y%m%dT%H%M%SZ")
+            start_dt = start_dt.replace(tzinfo=bp_tz).astimezone(timezone.utc)
+            end_dt = end_dt.replace(tzinfo=bp_tz).astimezone(timezone.utc)
 
-        url = f"https://calendar.google.com/calendar/render?action=TEMPLATE"
+        start_str = start_dt.strftime("%Y%m%dT%H%M%SZ")
+        end_str = end_dt.strftime("%Y%m%dT%H%M%SZ")
+
+        url = "https://calendar.google.com/calendar/render?action=TEMPLATE"
         url += f"&text={urllib.parse.quote(title)}"
         url += f"&dates={start_str}/{end_str}"
-        url += f"&ctz=Europe/Budapest"
+        url += "&ctz=Europe/Budapest"
         if location and location != "N/A":
             url += f"&location={urllib.parse.quote(location)}"
         if details:
-            url += f"&details={urllib.parse.quote(details)}"
+            # A details-ben lévő URL-ek & karaktereit %26-ra cseréljük,
+            # hogy a GCal ne vágja el az auctionId-t és más paramétereket.
+            safe_details = re.sub(
+                r'(https?://\S+)',
+                lambda m: m.group(0).replace('&', '%26'),
+                details
+            )
+            url += f"&details={urllib.parse.quote(safe_details)}"
         return url
     except Exception as e:
         logger.warning(f"Nem sikerült a naptár link generálása: {e}")
@@ -150,20 +228,40 @@ def parse_price_to_int(price_str):
     return int(cleaned) if cleaned else 0
 
 
+def extract_km_from_tavolsag(tavolsag_str: str) -> float | None:
+    """Kinyeri a km értéket a tavolsag stringből, pl. '42.3 km (31 perc autóval)' → 42.3"""
+    if not tavolsag_str:
+        return None
+    m = re.search(r'([\d.]+)\s*km', tavolsag_str)
+    return float(m.group(1)) if m else None
+
+
+def check_keywords(name: str) -> tuple[bool, str | None]:
+    """
+    Ellenőrzi a whitelist/blacklist szűrőket egy ingóság nevén.
+    Visszaad: (átment-e, kihagyás oka vagy None)
+    """
+    name_lower = name.lower()
+    if INGOSAG_WHITELIST:
+        if not any(w.lower() in name_lower for w in INGOSAG_WHITELIST):
+            return False, "nem szerepel a whitelist-en"
+    for b in INGOSAG_BLACKLIST:
+        if b.lower() in name_lower:
+            return False, f"blacklist ({b})"
+    return True, None
+
+
 def calculate_darabar(price_str, db_str):
     if not price_str or not db_str:
         return None
     try:
-        p_clean = price_str.replace(" ", "").replace("\xa0", "")
-        p_match = re.search(r"(\d+)", p_clean)
-        d_clean = db_str.replace(" ", "").replace("\xa0", "")
-        d_match = re.search(r"(\d+)", d_clean)
+        p_match = re.search(r"(\d+)", price_str.replace(" ", "").replace("\xa0", ""))
+        d_match = re.search(r"(\d+)", db_str.replace(" ", "").replace("\xa0", ""))
         if p_match and d_match:
             price = int(p_match.group(1))
             db = int(d_match.group(1))
             if db > 1:
-                darabar = round(price / db)
-                return f"{darabar:,} HUF/db".replace(",", " ")
+                return f"{round(price / db):,} HUF/db".replace(",", " ")
     except Exception as e:
         logger.warning(f"Nem sikerült a darabárat kiszámolni: {e}")
     return None
@@ -216,19 +314,30 @@ def simplify_address(address):
 
 
 def geocode_address(address):
+    cache = load_geocode_cache()
     candidates = simplify_address(address)
+
+    # Cache ellenőrzés minden variánson
+    for candidate in candidates:
+        if candidate in cache:
+            logger.info(f" -> Geokódolás cache-ből: {candidate}")
+            return tuple(cache[candidate])
+
     headers = {"User-Agent": "NAV-EAF-Scraper-V2/1.0"}
     for candidate in candidates:
         try:
             logger.info(f" -> Geokódolás megkísérlése ezzel: {candidate}")
             params = {"q": candidate, "format": "json", "limit": 1, "countrycodes": "hu"}
-            resp = requests.get(
+            resp = fetch_with_retry(
                 "https://nominatim.openstreetmap.org/search",
                 params=params, headers=headers, timeout=10
             )
             if resp.status_code == 200 and resp.json():
-                results = resp.json()
-                return float(results[0]["lat"]), float(results[0]["lon"])
+                result = resp.json()[0]
+                coords = (float(result["lat"]), float(result["lon"]))
+                cache[candidate] = list(coords)
+                save_geocode_cache(cache)
+                return coords
             time.sleep(1.1)
         except Exception as e:
             logger.warning(f"Geokódolási részhiba ({candidate}): {e}")
@@ -245,7 +354,7 @@ def get_drive_distance(coords):
             f"http://router.project-osrm.org/route/v1/driving/"
             f"{ORIGIN_LON},{ORIGIN_LAT};{dest_lon},{dest_lat}?overview=false"
         )
-        resp = requests.get(url, timeout=10)
+        resp = fetch_with_retry(url, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
             if data.get("routes"):
@@ -318,7 +427,7 @@ def parse_nav_eaf_details(url):
     logger.info(f"NAV oldal letöltése: {url}")
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, timeout=20, headers=headers)
+        resp = fetch_with_retry(url, timeout=20, headers=headers)
         resp.encoding = "ISO-8859-2"
         html_text = resp.text
     except Exception as e:
@@ -348,9 +457,7 @@ def parse_nav_eaf_details(url):
         if not relevant:
             continue
 
-        table = div.find("table", class_="DownloadAppsList")
-        if not table:
-            table = div.find("table")
+        table = div.find("table", class_="DownloadAppsList") or div.find("table")
         if not table:
             continue
 
@@ -697,10 +804,9 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
         logger.error("Hiba: Hiányzó Telegram token vagy chat ID!")
         return
 
-    # Ha van kép ÉS a caption belefér a Telegram 1024 karakteres limitjébe
     if image_url and len(caption) <= 1024:
         try:
-            img_resp = requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            img_resp = fetch_with_retry(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             if img_resp.status_code == 200 and "image" in img_resp.headers.get("Content-Type", ""):
                 url = f"https://api.telegram.org/bot{target_bot_token}/sendPhoto"
                 files = {"photo": ("image.jpg", img_resp.content, "image/jpeg")}
@@ -713,11 +819,9 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
         except Exception as e:
             logger.warning(f"Nem sikerült a képet küldeni: {e}")
 
-    # Ha van kép de a caption túl hosszú (>1024 karakter):
-    # először küldjük a képet caption nélkül, majd a szöveget külön
     elif image_url and len(caption) > 1024:
         try:
-            img_resp = requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            img_resp = fetch_with_retry(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             if img_resp.status_code == 200 and "image" in img_resp.headers.get("Content-Type", ""):
                 url = f"https://api.telegram.org/bot{target_bot_token}/sendPhoto"
                 files = {"photo": ("image.jpg", img_resp.content, "image/jpeg")}
@@ -730,7 +834,6 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
         except Exception as e:
             logger.warning(f"Nem sikerült a képet küldeni: {e}")
 
-    # Szöveg küldése (mindig, képtől függetlenül)
     try:
         url = f"https://api.telegram.org/bot{target_bot_token}/sendMessage"
         data = {
@@ -746,6 +849,42 @@ def send_via_requests(caption, image_url, target_bot_token, target_chat_id):
             logger.error(f"Telegram szöveg küldési hiba: {resp.text}")
     except Exception as e:
         logger.error(f"Nem sikerült kommunikálni a Telegram API-val: {e}")
+
+
+def send_summary(stats: dict):
+    """Napi összefoglaló küldése az ingóság bot csatornájára."""
+    if not BOT_TOKEN or not CHAT_ID:
+        return
+
+    total_sent = stats["elkuld_ingosag"] + stats["elkuld_ingatlan"] + stats["elkuld_mnv"]
+
+    lines = [
+        "📊 <b>Napi összefoglaló – Scraper V2.4</b>",
+        "",
+        f"📧 Feldolgozott e-mailek: {stats['emailek']}",
+        f"🔍 Talált NAV tételek: {stats['nav_talalt']}",
+        f"🔍 Talált MNV tételek: {stats['mnv_talalt']}",
+        f"🚫 Szűrt tételek: {stats['szurt']}",
+        f"✅ Elküldött ingóság: {stats['elkuld_ingosag']}",
+        f"✅ Elküldött NAV ingatlan: {stats['elkuld_ingatlan']}",
+        f"✅ Elküldött MNV ingatlan: {stats['elkuld_mnv']}",
+        f"<b>📨 Összesen elküldve: {total_sent}</b>",
+    ]
+
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(url, data={
+            "chat_id": CHAT_ID,
+            "text": "\n".join(lines),
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }, timeout=20)
+        logger.info("Napi összefoglaló elküldve.")
+    except Exception as e:
+        logger.warning(f"Összefoglaló küldési hiba: {e}")
+
+
+# =================== Üzenetépítő függvények ===================
 
 def build_ingatlan_message(a: dict, include_link: bool = True) -> str:
     arveres_nev = escape_html(a.get("kategoria_reszletes") or a.get("kategoria") or "Ingatlan árverés")
@@ -780,7 +919,7 @@ def build_ingatlan_message(a: dict, include_link: bool = True) -> str:
     egyeb_info = escape_html(egyeb_info)
 
     lines = [
-        f"🏠 <b>NAV INGATLAN TALÁLAT</b>",
+        "🏠 <b>NAV INGATLAN TALÁLAT</b>",
         f"📋 <b>{arveres_nev}</b>",
         "",
         "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
@@ -902,7 +1041,7 @@ def build_ingosag_message(a: dict, include_link: bool = True) -> str:
     egyeb_info = escape_html(egyeb_info)
 
     lines = [
-        f"🔔 <b>NAV INGÓSÁG TALÁLAT</b>",
+        "🔔 <b>NAV INGÓSÁG TALÁLAT</b>",
         f"📋 <b>{arveres_nev}</b>",
         "",
         "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
@@ -974,46 +1113,34 @@ def build_ingosag_message(a: dict, include_link: bool = True) -> str:
 # =================== Fuzzy csoportosítás ===================
 
 def normalize_for_fuzzy(name: str) -> str:
-    """
-    A tétel nevét előkészíti a fuzzy összehasonlításhoz:
-    - kisbetűsít
-    - eltávolítja a mértékegységeket és számokat (méret, mennyiség)
-    - eltávolítja a felesleges szóközöket
-    Így pl. "Zellia Primer 10ml" és "Zellia Primer 5ml" azonosnak fog tűnni.
-    """
     if not name:
         return ""
     lower = name.lower().strip()
-    # Mértékegységek és számok eltávolítása
     cleaned = re.sub(
         r'\b\d+\s*(ml|g|kg|db|cm|mm|m|l|cl|dl|ft|huf|%|")\b',
         '',
         lower,
         flags=re.IGNORECASE
     )
-    # Maradék számok eltávolítása (pl. méretjelzések)
     cleaned = re.sub(r'\b\d+\b', '', cleaned)
-    # Felesleges írásjelek és szóközök eltávolítása
     cleaned = re.sub(r'[,.\-_/\\]+', ' ', cleaned)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned
 
 
 def group_auctions_by_similarity(auctions: list, threshold: int = FUZZY_THRESHOLD) -> dict:
-    """
-    A tétel neveket fuzzy string matching segítségével hasonlítja össze.
-    Ha két név hasonlósága eléri a threshold%-ot, ugyanabba a csoportba kerülnek.
-    A rapidfuzz könyvtár token_sort_ratio módszerét használja, ami szórend-független.
-
-    Fallback: ha a rapidfuzz nem elérhető, pontos névegyezéssel csoportosít.
-    """
     if not auctions:
         return {}
 
-    # Normalizált nevek előkészítése
     normalized_names = []
     for a in auctions:
-        raw = a.get("cim") or a.get("ingatlan_megnevezes") or a.get("tetel_megnevezes") or a.get("kategoria_reszletes") or ""
+        raw = (
+            a.get("cim")
+            or a.get("ingatlan_megnevezes")
+            or a.get("tetel_megnevezes")
+            or a.get("kategoria_reszletes")
+            or ""
+        )
         normalized_names.append(normalize_for_fuzzy(raw))
 
     grouped = {}
@@ -1033,7 +1160,6 @@ def group_auctions_by_similarity(auctions: list, threshold: int = FUZZY_THRESHOL
             if RAPIDFUZZ_AVAILABLE:
                 score = fuzz.token_sort_ratio(normalized_names[i], normalized_names[j])
             else:
-                # Fallback: pontos egyezés a normalizált névvel
                 score = 100 if normalized_names[i] == normalized_names[j] else 0
 
             if score >= threshold:
@@ -1044,7 +1170,6 @@ def group_auctions_by_similarity(auctions: list, threshold: int = FUZZY_THRESHOL
                 group.append(b)
                 used.add(j)
 
-        # Csoport kulcsa: az első tétel normalizált neve (vagy URL ha nincs)
         key = normalized_names[i] or auctions[i]["url"]
         grouped[key] = group
 
@@ -1055,14 +1180,28 @@ def group_auctions_by_similarity(auctions: list, threshold: int = FUZZY_THRESHOL
 # =================== Fő logika ===================
 
 def main():
-    logger.info("=== SCRAPER V2.3 INDÍTÁSA ===")
+    logger.info("=== SCRAPER V2.4 INDÍTÁSA ===")
     since = datetime.now(timezone.utc) - timedelta(days=1)
+
     seen_urls = load_seen_urls()
+    seen_urls = clean_expired_seen_urls(seen_urls)
+
+    stats = {
+        "emailek": 0,
+        "nav_talalt": 0,
+        "mnv_talalt": 0,
+        "szurt": 0,
+        "elkuld_ingosag": 0,
+        "elkuld_ingatlan": 0,
+        "elkuld_mnv": 0,
+    }
 
     nav_eaf_htmls, mnv_ear_htmls = get_emails_since(since)
+    stats["emailek"] = len(nav_eaf_htmls) + len(mnv_ear_htmls)
 
     if not nav_eaf_htmls and not mnv_ear_htmls:
         logger.info("Nincs új, olvasatlan NAV/MNV e-mail feldolgozásra.")
+        send_summary(stats)
         return
 
     # =====================================================================
@@ -1080,6 +1219,7 @@ def main():
                 logger.info(f"Már feldolgozott NAV link kihagyása: {link}")
 
     unique_auctions = list({a["url"]: a for a in all_auctions}.values())
+    stats["nav_talalt"] = len(unique_auctions)
     logger.info(f"Összes új NAV EAF feldolgozandó tétel: {len(unique_auctions)}")
 
     # Szűrés
@@ -1095,13 +1235,33 @@ def main():
                 tulajdon = a.get("tulajdoni_hanyad", "")
                 if "1/1" not in tulajdon:
                     logger.info(f"-> [SZŰRŐ] Ingatlan kihagyva (Nem 1/1 tulajdon): {a.get('teljes_cim')} ({tulajdon})")
+                    stats["szurt"] += 1
                     continue
         else:
+            # Becsérték szűrő
             if MAX_INGOSAG_BECSERTEK is not None:
                 becsertek_int = parse_price_to_int(a.get("becsertek", ""))
                 if becsertek_int > MAX_INGOSAG_BECSERTEK:
                     logger.info(f"-> [SZŰRŐ] Ingóság kihagyva (Becsérték > {MAX_INGOSAG_BECSERTEK} HUF): {a.get('cim')} ({a.get('becsertek')})")
+                    stats["szurt"] += 1
                     continue
+
+            # Kulcsszó szűrő
+            name = a.get("cim") or ""
+            ok, reason = check_keywords(name)
+            if not ok:
+                logger.info(f"-> [SZŰRŐ] Ingóság kihagyva ({reason}): {name}")
+                stats["szurt"] += 1
+                continue
+
+        # Távolság szűrő (ingatlan + ingóság egyaránt)
+        if MAX_TAVOLSAG_KM is not None:
+            km = extract_km_from_tavolsag(a.get("tavolsag", ""))
+            if km is not None and km > MAX_TAVOLSAG_KM:
+                logger.info(f"-> [SZŰRŐ] Kihagyva (távolság: {km} km > {MAX_TAVOLSAG_KM} km): {a.get('cim')}")
+                stats["szurt"] += 1
+                continue
+
         filtered_auctions.append(a)
 
     logger.info(f"Szűrés után feldolgozandó tételek: {len(filtered_auctions)}")
@@ -1137,18 +1297,24 @@ def main():
 
         if token and chat_id:
             send_via_requests(caption, base.get("image_url"), token, chat_id)
+            # Azonnali mentés minden sikeres küldés után
             for a in auctions_list:
-                seen_urls.add(a["url"])
+                mark_seen(seen_urls, a["url"], save=True)
+            if is_real_estate:
+                stats["elkuld_ingatlan"] += 1
+            else:
+                stats["elkuld_ingosag"] += 1
         else:
             logger.error(f"Kihagyva! Hiányzó token vagy chat_id (Ingatlan volt? {is_real_estate})")
 
     # =====================================================================
-    # 2. MNV EAR feldolgozás – változatlan
+    # 2. MNV EAR feldolgozás
     # =====================================================================
     all_mnv = []
     for html in mnv_ear_htmls:
         all_mnv.extend(parse_mnv_ear_auctions(html))
 
+    stats["mnv_talalt"] = len(all_mnv)
     logger.info(f"Összes MNV EAR tétel az e-mail(ek)ből: {len(all_mnv)}")
 
     for a in all_mnv:
@@ -1167,6 +1333,7 @@ def main():
                 f"-> [SZŰRŐ] MNV tétel kihagyva (Kikiáltási ár {kikialtas_int:,} Ft >= {MAX_MNV_KIKIALTAS:,} Ft): "
                 f"{a.get('tetel_nev_azonosito')}"
             )
+            stats["szurt"] += 1
             continue
 
         logger.info(
@@ -1178,12 +1345,13 @@ def main():
             msg = build_mnv_ear_message(a)
             send_via_requests(msg, None, REAL_ESTATE_BOT_TOKEN, REAL_ESTATE_CHAT_ID)
             if mnv_key:
-                seen_urls.add(mnv_key)
+                mark_seen(seen_urls, mnv_key, save=True)  # Azonnali mentés
+            stats["elkuld_mnv"] += 1
         else:
             logger.error("Kihagyva! Hiányzó REAL_ESTATE_BOT_TOKEN vagy REAL_ESTATE_CHAT_ID")
 
-    save_seen_urls(seen_urls)
-    logger.info("=== SCRAPER V2.3 SIKERESEN LEFUTOTT ===")
+    send_summary(stats)
+    logger.info("=== SCRAPER V2.4 SIKERESEN LEFUTOTT ===")
 
 
 if __name__ == "__main__":
