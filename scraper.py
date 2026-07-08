@@ -58,6 +58,8 @@ INGOSAG_BLACKLIST: list[str] = ["alkatrész", "sérült", "törött"]
 MNV_INGATLAN_KATEGORIAK: list[str] = [
     "ingatlan", "lakás", "ház", "telek", "garázs", "üzlet", "épület",
     "iroda", "tanya", "föld", "nyaraló", "pince", "műhely", "csarnok",
+    "beépítetlen", "terület", "szántó", "rét", "legelő", "erdő",
+    "gyümölcsös", "szőlő", "kert", "udvar",
 ]
 
 FUZZY_THRESHOLD = 70
@@ -420,6 +422,45 @@ def scrape_main_image(soup):
                     return src if src.startswith("http") else BASE + "/" + src.lstrip("/")
     except Exception:
         pass
+    return None
+    
+ def scrape_mnv_image(auction_link: str) -> str | None:
+    """
+    Letölti az MNV EAR tétel oldalát és kinyeri az első tétel-képet.
+    A képek jellemzően /attachment/ útvonalon vannak, EAR vízjellel.
+    """
+    if not auction_link or auction_link == "#":
+        return None
+
+    BASE = "https://e-arveres.mnv.hu"
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = fetch_with_retry(auction_link, timeout=20, headers=headers)
+        if resp.status_code != 200:
+            logger.warning(f"MNV oldal letöltése sikertelen ({resp.status_code}): {auction_link}")
+            return None
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        for img in soup.find_all("img", src=True):
+            src = img["src"].strip()
+            # Layout/ikon/logó képek kiszűrése
+            if not src or any(skip in src.lower() for skip in
+                              ["logo", "icon", "spacer", "hunguard", "header", "banner", ".gif"]):
+                continue
+            # A tételképek jellemzően attachment vagy kép útvonalon
+            if "attachment" in src.lower() or "kep" in src.lower() or "image" in src.lower():
+                return src if src.startswith("http") else BASE + "/" + src.lstrip("/")
+
+        # Fallback: első értelmes méretű kép
+        for img in soup.find_all("img", src=True):
+            src = img["src"].strip()
+            if src and not any(skip in src.lower() for skip in
+                               ["logo", "icon", "spacer", "hunguard", ".gif"]):
+                return src if src.startswith("http") else BASE + "/" + src.lstrip("/")
+
+    except Exception as e:
+        logger.warning(f"MNV kép scrapelési hiba: {e}")
     return None
 
 
@@ -1445,9 +1486,32 @@ def main():
                 a["megye"] = ""
                 logger.info(f"   [MNV GEO] Nem sikerült: {mnv_address}")
 
+       # Kép scrapelése a tétel oldaláról (csak küldés előtt)
+        image_url = None
+        mnv_id = a.get("mnv_id")
+        if mnv_id:
+            match = re.match(r'(\d+)/', mnv_id)
+            if match:
+                auction_id = match.group(1)
+                if mnv_ingatlan:
+                    auction_link = (
+                        f"https://e-arveres.mnv.hu//index-ingatlan.html"
+                        f"?.actionId=action.auction.AuctionSummaryAction"
+                        f"&auctionId={auction_id}&FRAME_SKIP_DEJAVU=1"
+                    )
+                else:
+                    auction_link = (
+                        f"https://e-arveres.mnv.hu//index-ingosag.html"
+                        f"?.actionId=action.auction.AuctionSummaryAction"
+                        f"&auctionId={auction_id}&FRAME_SKIP_DEJAVU=1"
+                    )
+                image_url = scrape_mnv_image(auction_link)
+                if image_url:
+                    logger.info(f"   [MNV KÉP] Találat: {image_url}")
+
         if mnv_token and mnv_chat_id:
             msg = build_mnv_ear_message(a)
-            send_via_requests(msg, None, mnv_token, mnv_chat_id)
+            send_via_requests(msg, image_url, mnv_token, mnv_chat_id)
             if mnv_key:
                 mark_seen(seen_urls, mnv_key, save=True)
             if mnv_ingatlan:
