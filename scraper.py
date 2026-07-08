@@ -423,7 +423,7 @@ def scrape_main_image(soup):
     except Exception:
         pass
     return None
- def scrape_mnv_image(auction_link: str) -> str | None:
+def scrape_mnv_image(auction_link: str) -> str | None:
     """
     Letölti az MNV EAR tétel oldalát és kinyeri az első tétel-képet.
     A képek jellemzően /attachment/ útvonalon vannak, EAR vízjellel.
