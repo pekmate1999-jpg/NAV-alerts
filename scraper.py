@@ -664,7 +664,7 @@ def scrape_mnv_image(auction_link: str) -> str | None:
             low = src.lower()
             if any(b in low for b in MNV_IMAGE_BLOCK):
                 continue
-            if "/pictures/" in low and low.endswith((".jpg", ".jpeg", ".png")):
+            if "pictures/" in low and low.endswith((".jpg", ".jpeg", ".png")):
                 return src if src.startswith("http") else BASE + "/" + src.lstrip("/")
 
         # Nem talált valódi fotót – diagnosztika a loghoz
@@ -970,6 +970,29 @@ def is_mnv_ingatlan(alkategoria: str) -> bool:
     """True ha az MNV alkategória ingatlan, False ha ingóság."""
     a = alkategoria.lower()
     return any(k in a for k in MNV_INGATLAN_KATEGORIAK)
+
+
+def mnv_reszhanyad_nem_1_1(nev: str) -> bool:
+    """
+    Megnézi, hogy az MNV tétel nevében szerepel-e KIFEJEZETTEN nem 1/1
+    tulajdoni hányad (pl. '3/6 hányad', '1/2 tulajdoni hányad').
+    True  → a névben van nem-1/1 hányad → kiszűrendő
+    False → nincs említve VAGY 1/1 → átengedhető
+    A helyrajzi számokat (pl. '146/14 hrsz') NEM keveri a hányaddal,
+    mert csak 'hányad' szó közelében lévő törtet néz.
+    """
+    if not nev:
+        return False
+    low = nev.lower()
+    # Törtek, amelyek közelében ott a "hányad" / "tulajdoni" szó
+    for m in re.finditer(r'(\d+)\s*/\s*(\d+)', low):
+        start, end = m.start(), m.end()
+        ctx = low[max(0, start - 25):min(len(low), end + 25)]
+        if "hányad" in ctx or "tulajdoni" in ctx or "hanyad" in ctx:
+            szamlalo, nevezo = m.group(1), m.group(2)
+            if szamlalo != nevezo:   # 1/1, 2/2 stb. rendben; 3/6, 1/2 nem
+                return True
+    return False
 
 
 MNV_LABEL_FIELD = [
@@ -1684,6 +1707,16 @@ def main():
 
         # Típus meghatározása az alkategoria alapján
         mnv_ingatlan = is_mnv_ingatlan(a.get("alkategoria", ""))
+
+        # Ingatlan tulajdoni hányad szűrő – csak akkor vág, ha a névben
+        # KIFEJEZETTEN nem-1/1 hányad szerepel (pl. "3/6 hányad").
+        # Ha nincs említve, átengedi.
+        if mnv_ingatlan and CSAK_1_1_TULAJDON:
+            nev = a.get("tetel_nev_azonosito") or ""
+            if mnv_reszhanyad_nem_1_1(nev):
+                logger.info(f"-> [SZŰRŐ] MNV ingatlan kihagyva (nem 1/1 hányad): {nev}")
+                stats["szurt"] += 1
+                continue
 
         # Ingóság blacklist (ruha kiszűrése) – MNV
         if not mnv_ingatlan:
