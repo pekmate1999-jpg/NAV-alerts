@@ -10,6 +10,7 @@ import logging
 import re
 import socket
 import time
+import unicodedata
 import urllib.parse
 
 try:
@@ -43,16 +44,24 @@ logger = logging.getLogger(__name__)
 
 # ------------------- SZŰRŐK (BÁRMIKOR MÓDOSÍTHATÓ) -------------------
 CSAK_1_1_TULAJDON = True
-MAX_INGOSAG_BECSERTEK = 2000000
-MAX_MNV_INGATLAN_KIKIALTAS = 2000000   # MNV ingatlan kikiáltási ár limit
-MAX_MNV_INGOSAG_KIKIALTAS = 2000000    # MNV ingóság kikiáltási ár limit
+MAX_INGOSAG_BECSERTEK = 500000         # NAV ingóság becsérték limit
+MAX_MNV_INGATLAN_KIKIALTAS = 2000000   # MNV ingatlan kikiáltási ár limit (kemény vágás)
+MAX_MNV_INGOSAG_KIKIALTAS = 500000     # MNV ingóság kikiáltási ár limit
 
 # Maximális távolság Budapesttől km-ben. None = kikapcsolva
 MAX_TAVOLSAG_KM = None
 
-# Kulcsszó szűrők (NAV ingóságnál). INGOSAG_WHITELIST üres = nincs whitelist szűrés.
+# Kulcsszó szűrők (ingóságnál). INGOSAG_WHITELIST üres = nincs whitelist szűrés.
 INGOSAG_WHITELIST: list[str] = []
-INGOSAG_BLACKLIST: list[str] = ["alkatrész", "sérült", "törött"]
+# Ruházat és textil – ezek SOHA nem jönnek
+INGOSAG_BLACKLIST: list[str] = [
+    "ruha", "ruházat", "póló", "polo", "nadrág", "farmer", "szoknya",
+    "kabát", "dzseki", "pulóver", "pulover", "kardigán",
+    "blúz", "bluz", "zokni", "fehérnemű", "fehernemu", "bugyi",
+    "melltartó", "melltarto", "cipő", "cipo", "csizma", "papucs",
+    "szandál", "sapka", "sál", "kesztyű", "kesztyu", "textil",
+    "konfekció", "konfekcio", "divatáru", "divataru",
+]
 
 # MNV EAR: ingatlan kategóriák (ami NEM szerepel itt, ingóságnak számít)
 MNV_INGATLAN_KATEGORIAK: list[str] = [
@@ -68,6 +77,78 @@ FUZZY_THRESHOLD = 70
 SEEN_URLS_EXPIRY_DAYS = 90
 
 NAV_SENDER_DOMAINS = ["nav.gov.hu", "mnv.hu"]
+
+
+# =================== INGATLAN SCORE RENDSZER (NAV + MNV) ===================
+# Csak ingatlanokra vonatkozik. Ingóság mindig szűrő nélkül megy.
+# A súlyozott átlag a hiányzó komponenseket automatikusan kihagyja
+# (pl. MNV-nél nincs telekméret → csak távolság + ár + megye számít).
+
+INGATLAN_SCORE_ENABLED = True
+INGATLAN_MIN_SCORE = 3.0   # ez alatt NEM küld ingatlant
+
+# Távolság (km Budapest/Göd-től). Kisebb táv = magasabb pont.
+DISTANCE_SCORE = {
+    "enabled": True,
+    "weight": 30,
+    "thresholds": [   # sorrend számít: az első illeszkedő nyer
+        {"max_km": 30,  "points": 5},
+        {"max_km": 60,  "points": 4},
+        {"max_km": 100, "points": 3},
+        {"max_km": 150, "points": 2},
+    ],  # e felett: 1 pont
+}
+
+# Telekméret (m²). Nagyobb telek = magasabb pont. (NAV-nál elérhető, MNV-nél általában nem.)
+LAND_SIZE_SCORE = {
+    "enabled": True,
+    "weight": 25,
+    "thresholds": [   # a legnagyobb illeszkedő küszöb nyer
+        {"min_m2": 200,  "points": 2},
+        {"min_m2": 500,  "points": 3},
+        {"min_m2": 1000, "points": 4},
+        {"min_m2": 2000, "points": 5},
+    ],
+}
+
+# Ft/m² (ár / terület). Olcsóbb = magasabb pont.
+PRICE_PER_M2_SCORE = {
+    "enabled": True,
+    "weight": 35,
+    "thresholds": [   # az első illeszkedő nyer
+        {"max_ft_per_m2": 500,   "points": 5},
+        {"max_ft_per_m2": 1500,  "points": 4},
+        {"max_ft_per_m2": 3000,  "points": 3},
+        {"max_ft_per_m2": 6000,  "points": 2},
+    ],  # e felett: 1 pont
+}
+
+# Abszolút kikiáltási ár / minimál ajánlat. Olcsóbb = magasabb pont.
+# Főleg MNV-nél hasznos, ahol nincs telekméret (Ft/m² kiesik).
+PRICE_SCORE = {
+    "enabled": True,
+    "weight": 30,
+    "thresholds": [   # az első illeszkedő nyer
+        {"max_price": 200_000,   "points": 5},
+        {"max_price": 500_000,   "points": 4},
+        {"max_price": 1_000_000, "points": 3},
+        {"max_price": 2_000_000, "points": 2},
+    ],  # e felett: 1 pont
+}
+
+# Megye pontok. Ami nincs felsorolva: default_points.
+COUNTY_SCORE = {
+    "enabled": True,
+    "weight": 10,
+    "default_points": 2,
+    "scores": [
+        {"county": "Pest",     "points": 5},
+        {"county": "Budapest", "points": 5},
+        {"county": "Komárom",  "points": 4},
+        {"county": "Fejér",    "points": 4},
+        {"county": "Nógrád",   "points": 3},
+    ],
+}
 
 
 # =================== Seen URLs – timestamp-alapú, lejáratos ===================
@@ -260,6 +341,121 @@ def check_keywords(name: str) -> tuple[bool, str | None]:
     return True, None
 
 
+# =================== Ingatlan score (NAV + MNV) ===================
+
+def _normalize_megye(text: str) -> str:
+    """Ékezet-független kisbetűs forma megye-összevetéshez."""
+    nfkd = unicodedata.normalize("NFKD", (text or "").lower())
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def parse_terulet_m2(terulet_str) -> float | None:
+    """Kinyeri a m² értéket egy 'terulet' mezőből, pl. '1 234 m²' → 1234.0"""
+    if not terulet_str:
+        return None
+    s = str(terulet_str)
+    m = re.search(r"([\d]+(?:\s[\d]{3})*(?:[.,][\d]+)?)\s*(?:m[²2]|nm)", s, re.IGNORECASE)
+    if not m:
+        m = re.search(r"([\d]+(?:[.,][\d]+)?)", s)
+    if not m:
+        return None
+    num = m.group(1).replace(" ", "").replace(".", "").replace(",", ".")
+    try:
+        val = float(num)
+        return val if 5 <= val <= 250_000 else None
+    except ValueError:
+        return None
+
+
+def score_distance(dist_km: float | None) -> float | None:
+    if not DISTANCE_SCORE.get("enabled") or dist_km is None:
+        return None
+    for t in DISTANCE_SCORE["thresholds"]:
+        if dist_km <= t["max_km"]:
+            return float(t["points"])
+    return 1.0
+
+
+def score_land_size(telek_m2: float | None) -> float | None:
+    if not LAND_SIZE_SCORE.get("enabled") or telek_m2 is None:
+        return None
+    best = 1.0
+    for t in LAND_SIZE_SCORE["thresholds"]:
+        if telek_m2 >= t["min_m2"]:
+            best = float(t["points"])
+    return best
+
+
+def score_price_per_m2(price: int | None, area: float | None) -> float | None:
+    if not PRICE_PER_M2_SCORE.get("enabled") or not price or not area or area <= 0:
+        return None
+    ft_per_m2 = price / area
+    for t in PRICE_PER_M2_SCORE["thresholds"]:
+        if ft_per_m2 <= t["max_ft_per_m2"]:
+            return float(t["points"])
+    return 1.0
+
+
+def score_price(price: int | None) -> float | None:
+    if not PRICE_SCORE.get("enabled") or not price:
+        return None
+    for t in PRICE_SCORE["thresholds"]:
+        if price <= t["max_price"]:
+            return float(t["points"])
+    return 1.0
+
+
+def score_county(megye: str | None) -> float | None:
+    if not COUNTY_SCORE.get("enabled") or not megye:
+        return None
+    norm = _normalize_megye(megye)
+    for entry in COUNTY_SCORE["scores"]:
+        e = _normalize_megye(entry["county"])
+        if e in norm or norm in e:
+            return float(entry["points"])
+    return float(COUNTY_SCORE.get("default_points", 1))
+
+
+def calculate_ingatlan_score(price, area, dist_km, megye) -> tuple[float, dict]:
+    """
+    Súlyozott átlag 1–5 skálán. A hiányzó (None) komponenseket kihagyja
+    és a meglévőkre normalizál. Ha semmi sincs, 3.0 (semleges).
+    Visszaad: (score, komponens_bontás)
+    """
+    components: dict = {}
+    weighted_sum = 0.0
+    total_weight = 0.0
+
+    def add(name, val, cfg):
+        nonlocal weighted_sum, total_weight
+        if val is not None and cfg.get("enabled"):
+            w = cfg.get("weight", 0)
+            weighted_sum += val * w
+            total_weight += w
+            components[name] = round(val, 1)
+
+    add("távolság",  score_distance(dist_km),          DISTANCE_SCORE)
+    add("telek",     score_land_size(area),            LAND_SIZE_SCORE)
+    add("Ft/m²",     score_price_per_m2(price, area),  PRICE_PER_M2_SCORE)
+    add("ár",        score_price(price),               PRICE_SCORE)
+    add("megye",     score_county(megye),              COUNTY_SCORE)
+
+    if total_weight == 0:
+        return 3.0, {}
+    return round(weighted_sum / total_weight, 2), components
+
+
+def format_score(score: float, components: dict) -> str:
+    """Telegram HTML-barát score sor."""
+    full = round(score)
+    stars = "⭐" * full + "☆" * (5 - full)
+    details = " | ".join(f"{k}: {v:.1f}" for k, v in components.items())
+    line = f"🎯 <b>Értékelés:</b> {stars} <b>{score:.1f}/5</b>"
+    if details:
+        line += f"\n<i>{details}</i>"
+    return line
+
+
 def calculate_darabar(price_str, db_str):
     if not price_str or not db_str:
         return None
@@ -423,10 +619,28 @@ def scrape_main_image(soup):
     except Exception:
         pass
     return None
+
+
+# Ha True, és nem talál valódi fotót, kilogolja az összes img/pictures
+# útvonalat a GitHub Actions logba (diagnosztikához). Ha megvan a minta,
+# nyugodtan állítsd False-ra.
+MNV_IMAGE_DEBUG = True
+
+# Layout/ikon/gomb útvonalak – ezek SOHA nem valódi tételfotók
+MNV_IMAGE_BLOCK = [
+    "/images/", "/css/", "/js/", "gmap", "click", "slide",
+    "logo", "icon", "spacer", "hunguard", "banner", "button",
+    "arrow", "menu", ".gif", ".svg",
+]
+
+
 def scrape_mnv_image(auction_link: str) -> str | None:
     """
-    Letölti az MNV EAR tétel oldalát és kinyeri az első tétel-képet.
-    A képek jellemzően /attachment/ útvonalon vannak, EAR vízjellel.
+    Letölti az MNV EAR tétel oldalát és kinyeri a valódi tétel-fotót.
+    A valódi fotók /pictures/ útvonalon vannak (pl. /pictures/3/4/99117.jpg).
+    Layout-ikonokat (gmap/click/css/...) kizárja.
+    Ha nincs valódi fotó: None (inkább kép nélkül, mint rossz képpel),
+    és MNV_IMAGE_DEBUG esetén kilogolja a talált útvonalakat.
     """
     if not auction_link or auction_link == "#":
         return None
@@ -439,24 +653,33 @@ def scrape_mnv_image(auction_link: str) -> str | None:
             logger.warning(f"MNV oldal letöltése sikertelen ({resp.status_code}): {auction_link}")
             return None
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        html = resp.text
+        soup = BeautifulSoup(html, "html.parser")
 
-        for img in soup.find_all("img", src=True):
-            src = img["src"].strip()
-            # Layout/ikon/logó képek kiszűrése
-            if not src or any(skip in src.lower() for skip in
-                              ["logo", "icon", "spacer", "hunguard", "header", "banner", ".gif"]):
+        for img in soup.find_all("img"):
+            src = (img.get("src") or img.get("data-src")
+                   or img.get("data-original") or "").strip()
+            if not src:
                 continue
-            # A tételképek jellemzően attachment vagy kép útvonalon
-            if "attachment" in src.lower() or "kep" in src.lower() or "image" in src.lower():
+            low = src.lower()
+            if any(b in low for b in MNV_IMAGE_BLOCK):
+                continue
+            if "/pictures/" in low and low.endswith((".jpg", ".jpeg", ".png")):
                 return src if src.startswith("http") else BASE + "/" + src.lstrip("/")
 
-        # Fallback: első értelmes méretű kép
-        for img in soup.find_all("img", src=True):
-            src = img["src"].strip()
-            if src and not any(skip in src.lower() for skip in
-                               ["logo", "icon", "spacer", "hunguard", ".gif"]):
-                return src if src.startswith("http") else BASE + "/" + src.lstrip("/")
+        # Nem talált valódi fotót – diagnosztika a loghoz
+        if MNV_IMAGE_DEBUG:
+            all_imgs = []
+            for img in soup.find_all("img"):
+                s = (img.get("src") or img.get("data-src")
+                     or img.get("data-original") or "").strip()
+                if s:
+                    all_imgs.append(s)
+            pics = re.findall(r'''["'](/?[^"']*pictures[^"']*)["']''', html)
+            logger.warning(
+                f"[MNV KÉP DEBUG] Nincs /pictures/ fotó. "
+                f"img tagek: {all_imgs} | pictures-hivatkozások: {list(set(pics))}"
+            )
 
     except Exception as e:
         logger.warning(f"MNV kép scrapelési hiba: {e}")
@@ -858,6 +1081,10 @@ def build_mnv_ear_message(a: dict) -> str:
     lines = [
         header,
         f"📋 <b>{alkategoria}</b>",
+    ]
+    if a.get("score_line"):
+        lines.append(a["score_line"])
+    lines += [
         "",
         "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
         f"🏷 <b>Tétel:</b> {tetel}",
@@ -1029,6 +1256,10 @@ def build_ingatlan_message(a: dict, include_link: bool = True) -> str:
     lines = [
         "🏠 <b>NAV INGATLAN TALÁLAT</b>",
         f"📋 <b>{arveres_nev}</b>",
+    ]
+    if a.get("score_line"):
+        lines.append(a["score_line"])
+    lines += [
         "",
         "🌍 <b>1. Elhelyezkedés és Alapadatok</b>",
         f"🏷 <b>Megnevezés/Cím:</b> {ingatlan_nev}",
@@ -1346,6 +1577,19 @@ def main():
                     logger.info(f"-> [SZŰRŐ] Ingatlan kihagyva (Nem 1/1 tulajdon): {a.get('teljes_cim')} ({tulajdon})")
                     stats["szurt"] += 1
                     continue
+
+            # ---- SCORE (NAV ingatlan) ----
+            if INGATLAN_SCORE_ENABLED:
+                price = parse_price_to_int(a.get("minimal_ajanlat") or a.get("becsertek") or "")
+                area = parse_terulet_m2(a.get("terulet"))
+                dist_km = extract_km_from_tavolsag(a.get("tavolsag", ""))
+                score, comps = calculate_ingatlan_score(price or None, area, dist_km, a.get("megye"))
+                if score < INGATLAN_MIN_SCORE:
+                    logger.info(f"-> [SZŰRŐ] NAV ingatlan kihagyva (score {score} < {INGATLAN_MIN_SCORE}): {a.get('teljes_cim')}")
+                    stats["szurt"] += 1
+                    continue
+                a["score_line"] = format_score(score, comps)
+                logger.info(f"   [SCORE] NAV ingatlan {score} | {comps} | {a.get('teljes_cim')}")
         else:
             # Becsérték szűrő
             if MAX_INGOSAG_BECSERTEK is not None:
@@ -1441,7 +1685,16 @@ def main():
         # Típus meghatározása az alkategoria alapján
         mnv_ingatlan = is_mnv_ingatlan(a.get("alkategoria", ""))
 
-        # Típusfüggő ár szűrő
+        # Ingóság blacklist (ruha kiszűrése) – MNV
+        if not mnv_ingatlan:
+            name_for_check = a.get("tetel_nev_azonosito") or a.get("cim_rovid") or ""
+            ok, reason = check_keywords(name_for_check)
+            if not ok:
+                logger.info(f"-> [SZŰRŐ] MNV ingóság kihagyva ({reason}): {name_for_check}")
+                stats["szurt"] += 1
+                continue
+
+        # Típusfüggő ár szűrő (kemény vágás)
         ar_limit = MAX_MNV_INGATLAN_KIKIALTAS if mnv_ingatlan else MAX_MNV_INGOSAG_KIKIALTAS
         if ar_limit is not None and kikialtas_int >= ar_limit:
             logger.info(
@@ -1485,9 +1738,21 @@ def main():
                 a["megye"] = ""
                 logger.info(f"   [MNV GEO] Nem sikerült: {mnv_address}")
 
-       # Kép scrapelése a tétel oldaláról (csak küldés előtt)
+        # ---- SCORE (MNV ingatlan) – csak ingatlanra ----
+        if mnv_ingatlan and INGATLAN_SCORE_ENABLED:
+            price = parse_price_to_int(a.get("kikialtas_ar") or "")
+            area = None  # MNV hírlevélben nincs telekméret
+            dist_km = extract_km_from_tavolsag(a.get("tavolsag", ""))
+            score, comps = calculate_ingatlan_score(price or None, area, dist_km, a.get("megye"))
+            if score < INGATLAN_MIN_SCORE:
+                logger.info(f"-> [SZŰRŐ] MNV ingatlan kihagyva (score {score} < {INGATLAN_MIN_SCORE}): {a.get('tetel_nev_azonosito')}")
+                stats["szurt"] += 1
+                continue
+            a["score_line"] = format_score(score, comps)
+            logger.info(f"   [SCORE] MNV ingatlan {score} | {comps}")
+
+        # Kép scrapelése a tétel oldaláról (csak küldés előtt)
         image_url = None
-        mnv_id = a.get("mnv_id")
         if mnv_id:
             match = re.match(r'(\d+)/', mnv_id)
             if match:
